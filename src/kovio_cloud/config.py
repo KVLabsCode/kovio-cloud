@@ -33,10 +33,12 @@ class Settings(BaseSettings):
     # helper stays import-light. This field documents and validates the var too.
     key_pepper: str = "kovio-dev-pepper-change-in-prod"
 
-    # Supabase Auth JWT secret (HS256), used to verify human web-app sessions.
-    # Dashboard: Project Settings → API → JWT Secret. Read directly in
-    # supabase_auth.py; this field documents/validates it as part of Settings.
+    # Supabase Auth JWT secret (HS256 legacy), used to verify human web-app
+    # sessions signed with the shared secret. Dashboard: Project Settings → API.
     supabase_jwt_secret: str = ""
+    # Supabase project URL — used to derive the JWKS endpoint for verifying
+    # modern ES256/RS256-signed session tokens. Read directly in supabase_auth.py.
+    supabase_url: str = ""
 
     # --- Spend processor -------------------------------------------------------
     spend_processor_enabled: bool = True

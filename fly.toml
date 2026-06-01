@@ -6,6 +6,9 @@ primary_region = "iad"
 [env]
   KOVIO_ENVIRONMENT = "production"
   KOVIO_PORT = "8080"
+  # Public project URL — used to derive the JWKS endpoint for ES256 session-token
+  # verification. Not a secret (it's also embedded in the frontend).
+  KOVIO_SUPABASE_URL = "https://aoohvwipphkwroymarqm.supabase.co"
 
 [http_service]
   internal_port = 8080
