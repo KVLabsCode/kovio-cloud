@@ -1,0 +1,30 @@
+app = "kovio-api"
+primary_region = "iad"
+
+[build]
+
+[env]
+  KOVIO_ENVIRONMENT = "production"
+  KOVIO_PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Secrets (set out-of-band, never committed):
+#   fly secrets set KOVIO_DATABASE_URL="$(grep KOVIO_DATABASE_URL .env.production | cut -d= -f2-)"
+#   fly secrets set KOVIO_KEY_PEPPER="$(grep KOVIO_KEY_PEPPER .env.production | cut -d= -f2-)"
