@@ -128,6 +128,8 @@ async def me(
     if user is None or user.org_id is None:
         return _coded(404, "not_onboarded", "complete onboarding first")
     org = await _org_for(user, session)
+    if org.kind != "advertiser":
+        return _coded(403, "wrong_user_kind", "this user is an OEM, not an advertiser")
     return {"user": _user_dict(user), "org": _org_summary(org)}
 
 
