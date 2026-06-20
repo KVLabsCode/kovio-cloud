@@ -21,6 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..audience import audience_summary
 from ..auth import generate_api_key
 from ..db import get_session
 from ..models import ApiKey, Campaign, Fleet, Impression, Organization, Robot, User
@@ -245,6 +246,8 @@ async def dashboard(
                 Fleet.name,
                 func.count(Impression.id),
                 func.coalesce(func.sum(Impression.revenue_to_oem_cents), 0),
+                func.coalesce(func.avg(Impression.person_count), 0),
+                func.coalesce(func.avg(Impression.attended_count), 0),
             )
             .select_from(Fleet)
             .outerjoin(
@@ -262,6 +265,8 @@ async def dashboard(
             "fleet_name": r[1],
             "impressions_30d": int(r[2]),
             "revenue_30d_cents": int(r[3]),
+            "avg_reach_30d": round(float(r[4]), 1),
+            "avg_attended_30d": round(float(r[5]), 1),
         }
         for r in by_fleet_rows
     ]
@@ -298,6 +303,13 @@ async def dashboard(
         for r in recent_rows
     ]
 
+    audience_24h = await audience_summary(
+        session, Impression.oem_org_id == org_id, Impression.created_at >= since_24h
+    )
+    audience_30d = await audience_summary(
+        session, Impression.oem_org_id == org_id, Impression.created_at >= since_30d
+    )
+
     return {
         "pending_payout_cents": org.pending_payout_cents,
         "lifetime_payout_cents": org.lifetime_payout_cents,
@@ -308,6 +320,8 @@ async def dashboard(
         "total_fleets": total_fleets,
         "total_robots": total_robots,
         "active_robots": active_robots,
+        "audience_24h": audience_24h,
+        "audience_30d": audience_30d,
         "by_day": by_day,
         "by_fleet": by_fleet,
         "recent_impressions": recent_impressions,
@@ -467,6 +481,9 @@ async def fleet_detail(
             "revenue_24h_cents": await _scalar(_rev(since_24h)),
             "revenue_30d_cents": await _scalar(_rev(since_30d)),
             "by_day": _zero_filled_by_day(by_day_rows, now),
+            "audience_30d": await audience_summary(
+                session, Impression.fleet_id == fleet.id, Impression.created_at >= since_30d
+            ),
         },
     }
 

@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..audience import audience_summary
 from ..db import get_session
 from ..models import Campaign, Impression, Organization, Transaction, User
 from ..supabase_auth import SupabaseUser, require_supabase_user
@@ -144,8 +145,13 @@ async def onboarding(
     if existing is not None:
         return _coded(409, "already_onboarded", "this account is already linked to an org")
 
+    # New advertisers get one free campaign (the default setup) — handled at
+    # campaign-creation time, not as a prepaid balance. No credits/coins.
     org = Organization(
-        name=body.org_name, slug=body.org_slug, kind="advertiser", balance_cents=0
+        name=body.org_name,
+        slug=body.org_slug,
+        kind="advertiser",
+        balance_cents=0,
     )
     session.add(org)
     user = User(
@@ -232,6 +238,13 @@ async def dashboard(
         for r in recent_rows
     ]
 
+    audience_24h = await audience_summary(
+        session, Impression.advertiser_org_id == org_id, Impression.created_at >= since_24h
+    )
+    audience_30d = await audience_summary(
+        session, Impression.advertiser_org_id == org_id, Impression.created_at >= since_30d
+    )
+
     return {
         "balance_cents": org.balance_cents,
         "total_campaigns": total_campaigns,
@@ -241,6 +254,8 @@ async def dashboard(
         "impressions_30d": impressions_30d,
         "spent_24h_cents": spent_24h,
         "spent_30d_cents": spent_30d,
+        "audience_24h": audience_24h,
+        "audience_30d": audience_30d,
         "recent_impressions": recent,
     }
 
@@ -260,7 +275,35 @@ async def list_campaigns(
             select(Campaign).where(Campaign.org_id == user.org_id).order_by(Campaign.created_at.desc())
         )
     ).scalars().all()
-    return {"campaigns": [_campaign_dict(c) for c in rows]}
+
+    # Real per-campaign reach/attention totals from impressions (one grouped pass).
+    agg_rows = (
+        await session.execute(
+            select(
+                Impression.campaign_id,
+                func.count().label("impressions"),
+                func.coalesce(func.sum(Impression.person_count), 0).label("walked"),
+                func.coalesce(func.sum(Impression.attended_count), 0).label("attended"),
+            )
+            .where(Impression.advertiser_org_id == user.org_id)
+            .group_by(Impression.campaign_id)
+        )
+    ).all()
+    agg = {r.campaign_id: r for r in agg_rows}
+
+    def _with_stats(c: Campaign) -> dict[str, Any]:
+        a = agg.get(c.id)
+        impressions = int(a.impressions) if a else 0
+        attended = int(a.attended) if a else 0
+        return {
+            **_campaign_dict(c),
+            "impressions_total": impressions,
+            "walked_by_total": int(a.walked) if a else 0,
+            "attended_total": attended,
+            "attention_rate": (attended / impressions) if impressions else 0.0,
+        }
+
+    return {"campaigns": [_with_stats(c) for c in rows]}
 
 
 # --- POST /campaigns ---------------------------------------------------------
@@ -279,9 +322,9 @@ async def create_campaign(
         return _coded(400, "invalid_budget", "budget_total_cents must be > 0")
     if body.cost_per_impression_cents <= 0:
         return _coded(400, "invalid_cost", "cost_per_impression_cents must be > 0")
-    if org.balance_cents < body.budget_total_cents:
-        return _coded(402, "insufficient_balance",
-                      "deposit enough to cover the campaign budget first")
+    # NOTE: balance/payment gating is intentionally disabled until Stripe lands.
+    # Campaigns can be created freely so the end-to-end flow is testable; the
+    # spend processor (off in dev) is what would otherwise debit a balance.
 
     campaign = Campaign(
         org_id=org.id,
@@ -340,6 +383,16 @@ async def campaign_detail(
             )
         )).scalar_one()
     )
+    walked_attended = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(Impression.person_count), 0).label("walked"),
+                func.coalesce(func.sum(Impression.attended_count), 0).label("attended"),
+            ).where(Impression.campaign_id == campaign.id)
+        )
+    ).one()
+    walked_by_total = int(walked_attended.walked)
+    attended_total = int(walked_attended.attended)
 
     since_30d = datetime.now(timezone.utc) - timedelta(days=30)
     day = func.date(Impression.timestamp)
@@ -360,13 +413,20 @@ async def campaign_detail(
         for r in by_day_rows
     ]
 
+    audience_30d = await audience_summary(
+        session, Impression.campaign_id == campaign.id, Impression.timestamp >= since_30d
+    )
+
     return {
         "campaign": _campaign_dict(campaign),
         "stats": {
             "impressions_total": impressions_total,
             "spent_cents_total": spent_total,
             "remaining_cents": campaign.budget_total_cents - campaign.budget_spent_cents,
+            "walked_by_total": walked_by_total,
+            "attended_total": attended_total,
             "by_day": by_day,
+            "audience_30d": audience_30d,
         },
     }
 
