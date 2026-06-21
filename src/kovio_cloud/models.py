@@ -214,6 +214,11 @@ class Campaign(Base):
     enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("TRUE"), default=True
     )
+    # Zero-cost free-tier campaign (an org's first). The spend processor records
+    # its impressions but moves no money and skips the balance gate.
+    is_promo: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("FALSE"), default=False
+    )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default=text("'active'"), default="active"
     )

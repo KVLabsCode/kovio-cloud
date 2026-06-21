@@ -124,8 +124,17 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
             revenue_to_oem_cents = _cents(Decimal(cost_cents) * share_pct / Decimal(100))
             kovio_share_cents = cost_cents - revenue_to_oem_cents
 
+            # --- Free-tier promo: record the impression for reach/attention data
+            # but move no money. Zeroing the costs here exempts it from the
+            # balance gate below (0 debit never goes negative) so a free
+            # campaign on a 0-balance advertiser keeps running instead of pausing.
+            if campaign.is_promo:
+                cost_cents = 0
+                revenue_to_oem_cents = 0
+                kovio_share_cents = 0
+
             # --- Insufficient balance: decline, pause, don't create impression -
-            if advertiser.balance_cents - cost_cents < 0:
+            if cost_cents > 0 and advertiser.balance_cents - cost_cents < 0:
                 payload["declined"] = True
                 payload["reason"] = "insufficient_balance"
                 event.payload = payload
@@ -164,24 +173,26 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
             session.add(impression)
             await session.flush()  # assign impression.id for ledger references
 
-            session.add_all(
-                [
-                    Transaction(
-                        org_id=advertiser.id,
-                        kind="impression_charge",
-                        amount_cents=-cost_cents,
-                        reference_type="impression",
-                        reference_id=str(impression.id),
-                    ),
-                    Transaction(
-                        org_id=oem.id,
-                        kind="oem_accrual",
-                        amount_cents=revenue_to_oem_cents,
-                        reference_type="impression",
-                        reference_id=str(impression.id),
-                    ),
-                ]
-            )
+            # Promo impressions cost nothing, so they create no ledger entries.
+            if cost_cents > 0:
+                session.add_all(
+                    [
+                        Transaction(
+                            org_id=advertiser.id,
+                            kind="impression_charge",
+                            amount_cents=-cost_cents,
+                            reference_type="impression",
+                            reference_id=str(impression.id),
+                        ),
+                        Transaction(
+                            org_id=oem.id,
+                            kind="oem_accrual",
+                            amount_cents=revenue_to_oem_cents,
+                            reference_type="impression",
+                            reference_id=str(impression.id),
+                        ),
+                    ]
+                )
 
             campaign.budget_spent_cents += cost_cents
             advertiser.balance_cents -= cost_cents

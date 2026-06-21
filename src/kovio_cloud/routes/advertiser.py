@@ -65,6 +65,7 @@ def _campaign_dict(c: Campaign) -> dict[str, Any]:
         "category": c.category,
         "status": c.status,
         "enabled": c.enabled,
+        "is_promo": c.is_promo,
         "priority": c.priority,
         "encounter_cap_seconds": c.encounter_cap_seconds,
         "budget_total_cents": c.budget_total_cents,
@@ -300,7 +301,9 @@ async def list_campaigns(
             "impressions_total": impressions,
             "walked_by_total": int(a.walked) if a else 0,
             "attended_total": attended,
-            "attention_rate": (attended / impressions) if impressions else 0.0,
+            # Attention = people who faced the screen / people who passed by.
+            # NOT / impressions (that can exceed 1.0 and render as "300%").
+            "attention_rate": (attended / int(a.walked)) if a and a.walked else 0.0,
         }
 
     return {"campaigns": [_with_stats(c) for c in rows]}
@@ -325,6 +328,17 @@ async def create_campaign(
     # NOTE: balance/payment gating is intentionally disabled until Stripe lands.
     # Campaigns can be created freely so the end-to-end flow is testable; the
     # spend processor (off in dev) is what would otherwise debit a balance.
+    #
+    # Free-tier: an org's FIRST campaign is a zero-cost promo ("your first
+    # campaign is on us"). The spend processor records its impressions for
+    # reach/attention data but moves no money and is exempt from the balance
+    # gate, so a newly-onboarded advertiser (balance 0) isn't silently paused.
+    existing_count = (
+        await session.execute(
+            select(func.count()).select_from(Campaign).where(Campaign.org_id == org.id)
+        )
+    ).scalar_one()
+    is_promo = existing_count == 0
 
     campaign = Campaign(
         org_id=org.id,
@@ -343,6 +357,7 @@ async def create_campaign(
         end_at=body.end_at,
         status="active",
         enabled=True,
+        is_promo=is_promo,
     )
     session.add(campaign)
     try:

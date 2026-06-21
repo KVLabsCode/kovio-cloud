@@ -41,7 +41,10 @@ async def audience_summary(session: AsyncSession, *conditions: Any) -> dict[str,
         "avg_reach": round(float(row.avg_reach), 1),
         "peak_reach": int(row.peak_reach),
         "avg_attended": round(float(row.avg_attended), 1),
-        # No dwell/proximity columns on impressions yet — report neutral values.
+        # No dwell/proximity columns on impressions yet. These are SENTINELS,
+        # not measured zeros: avg_dwell_s=0.0 / nearest_m=None mean "no data".
+        # Consumers MUST guard on the value (e.g. avg_dwell_s > 0 ? ... : "—"),
+        # NOT on `samples`, which can be > 0 while dwell is still a placeholder.
         "avg_dwell_s": 0.0,
         "nearest_m": None,
     }
