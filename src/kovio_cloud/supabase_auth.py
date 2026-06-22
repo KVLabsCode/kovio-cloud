@@ -23,9 +23,15 @@ from jwt import PyJWKClient
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .config import get_settings
+
+# Read config from pydantic-settings (which loads .env) rather than os.environ
+# directly — the .env file is never exported into the process environment, so
+# os.environ.get() here would be empty and ES256 verification would always fail.
+_settings = get_settings()
 _security = HTTPBearer(auto_error=False)
-_JWT_SECRET = os.environ.get("KOVIO_SUPABASE_JWT_SECRET", "")
-_SUPABASE_URL = os.environ.get("KOVIO_SUPABASE_URL", "").rstrip("/")
+_JWT_SECRET = _settings.supabase_jwt_secret or os.environ.get("KOVIO_SUPABASE_JWT_SECRET", "")
+_SUPABASE_URL = (_settings.supabase_url or os.environ.get("KOVIO_SUPABASE_URL", "")).rstrip("/")
 _JWKS_URL = os.environ.get("KOVIO_SUPABASE_JWKS_URL", "") or (
     f"{_SUPABASE_URL}/auth/v1/.well-known/jwks.json" if _SUPABASE_URL else ""
 )

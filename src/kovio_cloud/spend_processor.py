@@ -11,7 +11,7 @@ does not roll back events #1-49.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
@@ -32,6 +32,47 @@ def _cents(value: Decimal) -> int:
     """Round a Decimal cent amount to the nearest whole integer cent."""
 
     return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+# How far back to look for the LiDAR scene that was current when an ad played.
+_SCENE_WINDOW = timedelta(seconds=300)
+
+
+async def _scene_for_event(session: AsyncSession, event: EventRaw) -> dict:
+    """Resolve the LiDAR scene concurrent with an ``ad_played`` event.
+
+    Robots emit ``scene_observed`` (``person_count`` / ``attended_count`` /
+    ``mean_distance_m``) continuously and ``ad_played`` when a creative shows;
+    the scene sampled at/just-before the play is what that impression actually
+    reached. The ``ad_played`` payload itself carries no audience counts, so we
+    correlate by robot + timestamp. Returns neutral values (0 / None) when no
+    scene is available — robot unknown, or no sample within ``_SCENE_WINDOW``.
+    """
+
+    empty = {"person": 0, "attended": 0, "mean_distance_m": None}
+    if event.robot_id is None:
+        return empty
+    payload = (
+        await session.execute(
+            select(EventRaw.payload)
+            .where(
+                EventRaw.robot_id == event.robot_id,
+                EventRaw.event_type == "scene_observed",
+                EventRaw.timestamp <= event.timestamp,
+                EventRaw.timestamp >= event.timestamp - _SCENE_WINDOW,
+            )
+            .order_by(EventRaw.timestamp.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if not payload:
+        return empty
+    p = dict(payload)
+    return {
+        "person": int(p.get("person_count", 0) or 0),
+        "attended": int(p.get("attended_count", 0) or 0),
+        "mean_distance_m": p.get("mean_distance_m"),
+    }
 
 
 async def process_pending_events(session: AsyncSession, limit: int = 1000) -> dict:
@@ -111,21 +152,42 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
                 )
             ).scalar_one()
 
-            # --- Cost computation ----------------------------------------------
-            attended = int(payload.get("attended_count", 0) or 0)
-            person = int(payload.get("person_count", 0) or 0)
+            # --- Audience: correlate the concurrent LiDAR scene ----------------
+            # ad_played carries no audience counts; source them (and proximity)
+            # from the scene the robot observed when the creative showed. A
+            # payload value, if ever present, wins over the correlated scene.
+            scene = await _scene_for_event(session, event)
+            attended = int(payload.get("attended_count", scene["attended"]) or 0)
+            person = int(payload.get("person_count", scene["person"]) or 0)
+            min_distance_m = payload.get("mean_distance_m", scene["mean_distance_m"])
 
+            # --- Gross cost: the campaign's real price for this impression. Used
+            # for budget accounting for EVERY campaign (incl. promos), so the
+            # budget still exhausts and the campaign pauses.
             cost = Decimal(campaign.cost_per_impression_cents)
             if attended > 0:
                 cost += Decimal(campaign.cost_per_attended_cents) * attended
-            cost_cents = _cents(cost)
+            gross_cost_cents = _cents(cost)
 
-            share_pct = Decimal(fleet.revenue_share_pct)
-            revenue_to_oem_cents = _cents(Decimal(cost_cents) * share_pct / Decimal(100))
-            kovio_share_cents = cost_cents - revenue_to_oem_cents
+            # --- Money movement. A free-tier promo records the impression (so
+            # reach/attention/proximity data flows) and accrues its gross cost
+            # against budget_spent_cents — so budget_total_cents is a real, finite
+            # free quota that still pauses the campaign — but debits nothing and
+            # writes no ledger. Paid campaigns charge the gross cost as before.
+            if campaign.is_promo:
+                charge_cents = 0
+                revenue_to_oem_cents = 0
+                kovio_share_cents = 0
+            else:
+                charge_cents = gross_cost_cents
+                share_pct = Decimal(fleet.revenue_share_pct)
+                revenue_to_oem_cents = _cents(
+                    Decimal(charge_cents) * share_pct / Decimal(100)
+                )
+                kovio_share_cents = charge_cents - revenue_to_oem_cents
 
             # --- Insufficient balance: decline, pause, don't create impression -
-            if advertiser.balance_cents - cost_cents < 0:
+            if charge_cents > 0 and advertiser.balance_cents - charge_cents < 0:
                 payload["declined"] = True
                 payload["reason"] = "insufficient_balance"
                 event.payload = payload
@@ -142,7 +204,7 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
                     campaign_id=campaign.campaign_id,
                     advertiser=advertiser.slug,
                     balance_cents=advertiser.balance_cents,
-                    cost_cents=cost_cents,
+                    cost_cents=charge_cents,
                 )
                 continue
 
@@ -156,7 +218,8 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
                 robot_id=event.robot_id,
                 person_count=person,
                 attended_count=attended,
-                cost_cents=cost_cents,
+                min_distance_m=min_distance_m,
+                cost_cents=charge_cents,
                 revenue_to_oem_cents=revenue_to_oem_cents,
                 kovio_share_cents=kovio_share_cents,
                 timestamp=event.timestamp,
@@ -164,27 +227,32 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
             session.add(impression)
             await session.flush()  # assign impression.id for ledger references
 
-            session.add_all(
-                [
-                    Transaction(
-                        org_id=advertiser.id,
-                        kind="impression_charge",
-                        amount_cents=-cost_cents,
-                        reference_type="impression",
-                        reference_id=str(impression.id),
-                    ),
-                    Transaction(
-                        org_id=oem.id,
-                        kind="oem_accrual",
-                        amount_cents=revenue_to_oem_cents,
-                        reference_type="impression",
-                        reference_id=str(impression.id),
-                    ),
-                ]
-            )
+            # Promo impressions move no money, so they create no ledger entries.
+            if charge_cents > 0:
+                session.add_all(
+                    [
+                        Transaction(
+                            org_id=advertiser.id,
+                            kind="impression_charge",
+                            amount_cents=-charge_cents,
+                            reference_type="impression",
+                            reference_id=str(impression.id),
+                        ),
+                        Transaction(
+                            org_id=oem.id,
+                            kind="oem_accrual",
+                            amount_cents=revenue_to_oem_cents,
+                            reference_type="impression",
+                            reference_id=str(impression.id),
+                        ),
+                    ]
+                )
 
-            campaign.budget_spent_cents += cost_cents
-            advertiser.balance_cents -= cost_cents
+            # Budget accrues the GROSS cost for every campaign (promos included)
+            # so budget_total_cents is a finite quota that pauses the campaign;
+            # only real (non-promo) charges move money.
+            campaign.budget_spent_cents += gross_cost_cents
+            advertiser.balance_cents -= charge_cents
             oem.pending_payout_cents += revenue_to_oem_cents
 
             if (
