@@ -326,6 +326,10 @@ class Impression(Base):
     attended_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0"), default=0
     )
+    # Closest person to the screen during this ad, in metres, sourced from the
+    # concurrent ``scene_observed`` LiDAR sample (``mean_distance_m``). NULL when
+    # no scene was available — the audience summary surfaces that as "—".
+    min_distance_m: Mapped[float | None] = mapped_column(Numeric(6, 2))
     # Money split for this single impression
     cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     revenue_to_oem_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)

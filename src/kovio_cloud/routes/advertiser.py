@@ -205,22 +205,22 @@ async def dashboard(
     )
     impressions_24h = await _scalar(
         select(func.count()).select_from(Impression).where(
-            Impression.advertiser_org_id == org_id, Impression.created_at >= since_24h
+            Impression.advertiser_org_id == org_id, Impression.timestamp >= since_24h
         )
     )
     impressions_30d = await _scalar(
         select(func.count()).select_from(Impression).where(
-            Impression.advertiser_org_id == org_id, Impression.created_at >= since_30d
+            Impression.advertiser_org_id == org_id, Impression.timestamp >= since_30d
         )
     )
     spent_24h = await _scalar(
         select(func.coalesce(func.sum(Impression.cost_cents), 0)).where(
-            Impression.advertiser_org_id == org_id, Impression.created_at >= since_24h
+            Impression.advertiser_org_id == org_id, Impression.timestamp >= since_24h
         )
     )
     spent_30d = await _scalar(
         select(func.coalesce(func.sum(Impression.cost_cents), 0)).where(
-            Impression.advertiser_org_id == org_id, Impression.created_at >= since_30d
+            Impression.advertiser_org_id == org_id, Impression.timestamp >= since_30d
         )
     )
 
@@ -240,10 +240,10 @@ async def dashboard(
     ]
 
     audience_24h = await audience_summary(
-        session, Impression.advertiser_org_id == org_id, Impression.created_at >= since_24h
+        session, Impression.advertiser_org_id == org_id, Impression.timestamp >= since_24h
     )
     audience_30d = await audience_summary(
-        session, Impression.advertiser_org_id == org_id, Impression.created_at >= since_30d
+        session, Impression.advertiser_org_id == org_id, Impression.timestamp >= since_30d
     )
 
     return {

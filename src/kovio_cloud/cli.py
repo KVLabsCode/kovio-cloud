@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import typer
+from sqlalchemy import select
 
 from .auth import generate_api_key
 from .config import get_settings
 from .db import get_logger, session_scope
-from .models import ApiKey, Campaign, Fleet, Organization, Robot, Transaction
+from .models import (
+    ApiKey,
+    Campaign,
+    EventRaw,
+    Fleet,
+    Organization,
+    Robot,
+    Transaction,
+)
 
 app = typer.Typer(help="Kovio cloud control-plane CLI.", no_args_is_help=True)
 log = get_logger("kovio_cloud.cli")
@@ -198,6 +209,131 @@ def bootstrap(
             "     to link the new Supabase user to a fresh Kovio org.\n"
             "  3. Then /advertiser/v1/me, /deposit, /campaigns, /dashboard all work for that org."
         )
+
+
+# =====================================================================
+# seed-events  (dev/test: give the spend processor + dashboards real data)
+# =====================================================================
+async def _seed_events(per_campaign: int) -> dict:
+    """Emit paired scene_observed + ad_played events for the demo fleet so the
+    spend processor produces impressions carrying real reach/attention/proximity,
+    plus a zero-balance PROMO campaign on a tiny budget to exercise the
+    free-tier exhaustion path. Idempotent-ish: event_ids are random, so re-runs
+    add more events rather than failing.
+    """
+
+    now = datetime.now(timezone.utc)
+    async with session_scope() as session:
+        fleet = (
+            await session.execute(select(Fleet).where(Fleet.name == "Demo Pilot Fleet"))
+        ).scalar_one_or_none()
+        robot = (
+            await session.execute(select(Robot).where(Robot.external_id == "tank-001"))
+        ).scalar_one_or_none()
+        if fleet is None or robot is None:
+            raise RuntimeError("demo fleet/robot not found — run `bootstrap` first")
+
+        campaigns = list(
+            (await session.execute(select(Campaign).where(Campaign.is_promo.is_(False)))).scalars()
+        )
+
+        def _emit(event_type: str, payload: dict, ts: datetime) -> None:
+            session.add(
+                EventRaw(
+                    event_id=uuid.uuid4(),
+                    robot_id=robot.id,
+                    fleet_id=fleet.id,
+                    robot_external_id=robot.external_id,
+                    event_type=event_type,
+                    payload=payload,
+                    timestamp=ts,
+                )
+            )
+
+        created = 0
+        for ci, c in enumerate(campaigns):
+            for i in range(per_campaign):
+                # Spread over ~20 days; the modulo keeps some plays inside 24h.
+                minutes_ago = (i * 17 + ci * 5) % (20 * 24 * 60)
+                ts = now - timedelta(minutes=minutes_ago)
+                person = 1 + ((i + ci) % 5)  # 1..5 people in frame
+                attended = max(0, person - (i % 3))  # <= person, some 0
+                dist = round(1.0 + ((i * 7 + ci * 3) % 40) / 10.0, 2)  # 1.0..4.9 m
+                _emit(
+                    "scene_observed",
+                    {"person_count": person, "attended_count": attended, "mean_distance_m": dist},
+                    ts,
+                )
+                _emit(
+                    "ad_played",
+                    {
+                        "campaign_id": c.campaign_id,
+                        "advertiser": c.advertiser,
+                        "creative_path": c.creative_url,
+                    },
+                    ts + timedelta(seconds=2),
+                )
+                created += 2
+
+        # --- Promo path: a zero-balance advertiser's first (free) campaign on a
+        # tiny budget, with enough plays to blow past it. After process-spend it
+        # should PAUSE (budget exhausted) while moving no money. ----------------
+        suffix = uuid.uuid4().hex[:6]
+        promo_adv = Organization(
+            name=f"Promo Tester {suffix}",
+            slug=f"promo-tester-{suffix}",
+            kind="advertiser",
+            balance_cents=0,
+        )
+        session.add(promo_adv)
+        await session.flush()
+        promo = Campaign(
+            org_id=promo_adv.id,
+            campaign_id=f"promo_free_{suffix}",
+            name="Promo Tester — Free First Campaign",
+            advertiser=promo_adv.name,
+            creative_url="creatives/promo.html",
+            category="brand",
+            budget_total_cents=30,  # 3 impressions @ 10c notional -> exhausts fast
+            cost_per_impression_cents=10,
+            is_promo=True,
+            status="active",
+            enabled=True,
+        )
+        session.add(promo)
+        for i in range(8):
+            ts = now - timedelta(minutes=i * 3)
+            _emit(
+                "scene_observed",
+                {"person_count": 3, "attended_count": 2, "mean_distance_m": 2.0},
+                ts,
+            )
+            _emit(
+                "ad_played",
+                {"campaign_id": promo.campaign_id, "advertiser": promo.advertiser},
+                ts + timedelta(seconds=2),
+            )
+            created += 2
+
+    return {
+        "events_created": created,
+        "paid_campaigns": len(campaigns),
+        "promo_campaign": promo.campaign_id,
+        "promo_advertiser_slug": promo_adv.slug,
+    }
+
+
+@app.command(name="seed-events")
+def seed_events(
+    per_campaign: int = typer.Option(
+        40, "--per-campaign", help="scene_observed+ad_played pairs per paid campaign."
+    ),
+) -> None:
+    """Seed demo LiDAR/ad events (run after `bootstrap`, then `process-spend`)."""
+
+    result = asyncio.run(_seed_events(per_campaign))
+    typer.secho(json.dumps(result, indent=2), fg=typer.colors.GREEN)
+    typer.secho("Now run `process-spend` to cost these into impressions.", fg=typer.colors.CYAN)
 
 
 # =====================================================================
