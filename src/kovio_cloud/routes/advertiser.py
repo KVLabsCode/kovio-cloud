@@ -129,6 +129,18 @@ class DepositBody(BaseModel):
 
 class CheckoutBody(BaseModel):
     amount_cents: int
+    # Optional relative return paths (e.g. "/campaigns/new?resume=1") so the
+    # caller can return into a flow instead of the deposit page. Validated to be
+    # app-relative to prevent open redirects.
+    success_path: str | None = None
+    cancel_path: str | None = None
+
+
+def _safe_path(p: str | None, default: str) -> str:
+    """Accept only app-relative paths ("/...", not "//..."); else the default."""
+    if not p or not p.startswith("/") or p.startswith("//"):
+        return default
+    return p
 
 
 # --- GET /me -----------------------------------------------------------------
@@ -581,8 +593,8 @@ async def checkout(
                     "quantity": 1,
                 }
             ],
-            success_url=f"{settings.web_app_url}/deposit?status=success",
-            cancel_url=f"{settings.web_app_url}/deposit?status=cancel",
+            success_url=f"{settings.web_app_url}{_safe_path(body.success_path, '/deposit?status=success')}",
+            cancel_url=f"{settings.web_app_url}{_safe_path(body.cancel_path, '/deposit?status=cancel')}",
             metadata={"org_id": str(org.id), "amount_cents": str(body.amount_cents)},
         )
     except Exception:
