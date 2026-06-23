@@ -5,18 +5,23 @@ API key. After verifying the JWT we look up the caller in the ``users`` table to
 resolve their ``org_id``; all data is scoped to that org and never crosses the
 boundary. A verified user with no ``users`` row is "not onboarded".
 
-No Stripe yet: ``/deposit`` credits the balance directly. When Stripe lands, the
-endpoint becomes a Checkout-session creator + webhook handler; the frontend
-signature won't change.
+Payments: prepaid balance model. ``/checkout`` creates a Stripe Checkout session;
+on ``checkout.session.completed`` the ``/stripe/webhook`` handler credits
+``balance_cents`` (idempotent on the session id). The spend processor then draws
+that balance down per impression. Stripe is optional — with no key configured
+the payment endpoints return 503 so dev still works. ``/deposit`` remains a
+dev-only direct credit.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, status
+import stripe
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -24,11 +29,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..audience import audience_summary
-from ..db import get_session
+from ..config import get_settings
+from ..db import get_logger, get_session
 from ..models import Campaign, Impression, Organization, Transaction, User
 from ..supabase_auth import SupabaseUser, require_supabase_user
 
 router = APIRouter(prefix="/advertiser/v1", tags=["advertiser"])
+log = get_logger("kovio_cloud.advertiser")
 
 _MAX_DEPOSIT_CENTS = 1_000_000  # $10K cap to avoid absurd test values
 
@@ -117,6 +124,10 @@ class CampaignBody(BaseModel):
 
 
 class DepositBody(BaseModel):
+    amount_cents: int
+
+
+class CheckoutBody(BaseModel):
     amount_cents: int
 
 
@@ -325,20 +336,26 @@ async def create_campaign(
         return _coded(400, "invalid_budget", "budget_total_cents must be > 0")
     if body.cost_per_impression_cents <= 0:
         return _coded(400, "invalid_cost", "cost_per_impression_cents must be > 0")
-    # NOTE: balance/payment gating is intentionally disabled until Stripe lands.
-    # Campaigns can be created freely so the end-to-end flow is testable; the
-    # spend processor (off in dev) is what would otherwise debit a balance.
-    #
     # Free-tier: an org's FIRST campaign is a zero-cost promo ("your first
-    # campaign is on us"). The spend processor records its impressions for
-    # reach/attention data but moves no money and is exempt from the balance
-    # gate, so a newly-onboarded advertiser (balance 0) isn't silently paused.
+    # campaign is on us") and is exempt from the balance gate. Every later
+    # campaign is paid and must be fully funded — the advertiser tops up their
+    # balance via Stripe Checkout (/checkout → webhook credits balance_cents)
+    # before launching. The spend processor then draws that balance down.
     existing_count = (
         await session.execute(
             select(func.count()).select_from(Campaign).where(Campaign.org_id == org.id)
         )
     ).scalar_one()
     is_promo = existing_count == 0
+
+    # The balance gate only bites once Stripe payments are configured; until then
+    # paid campaigns stay free to create (no funding path exists yet).
+    if get_settings().stripe_secret_key and not is_promo and org.balance_cents < body.budget_total_cents:
+        return _coded(
+            402,
+            "insufficient_balance",
+            "add funds to cover this campaign's budget before launching",
+        )
 
     campaign = Campaign(
         org_id=org.id,
@@ -507,6 +524,132 @@ async def deposit(
     )
     await session.flush()
     return {"balance_cents": org.balance_cents}
+
+
+# --- POST /checkout (Stripe) -------------------------------------------------
+@router.post("/checkout")
+async def checkout(
+    body: CheckoutBody,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a Stripe Checkout session to top up the advertiser's balance.
+
+    Returns ``{"url": ...}`` for the client to redirect to. The balance is NOT
+    credited here — only the webhook does that, after Stripe confirms payment.
+    """
+
+    settings = get_settings()
+    if not settings.stripe_secret_key:
+        return _coded(503, "stripe_unconfigured", "payments are not configured yet")
+
+    user = await _lookup_user(supa, session)
+    if user is None or user.org_id is None:
+        return _coded(404, "not_onboarded", "complete onboarding first")
+    if body.amount_cents <= 0:
+        return _coded(400, "invalid_amount", "amount_cents must be > 0")
+    if body.amount_cents > _MAX_DEPOSIT_CENTS:
+        return _coded(400, "amount_too_large", f"amount_cents capped at {_MAX_DEPOSIT_CENTS}")
+
+    org = await _org_for(user, session)
+    if org.kind != "advertiser":
+        return _coded(403, "wrong_user_kind", "this user is an OEM, not an advertiser")
+
+    stripe.api_key = settings.stripe_secret_key
+    try:
+        if not org.stripe_customer_id:
+            customer = await asyncio.to_thread(
+                stripe.Customer.create,
+                name=org.name,
+                email=user.email,
+                metadata={"org_id": str(org.id), "org_slug": org.slug},
+            )
+            org.stripe_customer_id = customer.id
+            await session.flush()
+
+        checkout_session = await asyncio.to_thread(
+            stripe.checkout.Session.create,
+            mode="payment",
+            customer=org.stripe_customer_id,
+            line_items=[
+                {
+                    "price_data": {
+                        "currency": "usd",
+                        "product_data": {"name": f"Kovio ad credit — {org.name}"},
+                        "unit_amount": body.amount_cents,
+                    },
+                    "quantity": 1,
+                }
+            ],
+            success_url=f"{settings.web_app_url}/deposit?status=success",
+            cancel_url=f"{settings.web_app_url}/deposit?status=cancel",
+            metadata={"org_id": str(org.id), "amount_cents": str(body.amount_cents)},
+        )
+    except Exception:
+        log.exception("stripe_checkout_failed", org=org.slug)
+        return _coded(502, "stripe_error", "could not start checkout; please try again")
+
+    return {"url": checkout_session.url}
+
+
+# --- POST /stripe/webhook ----------------------------------------------------
+# Unauthenticated by design — Stripe calls this. The signature IS the auth.
+@router.post("/stripe/webhook")
+async def stripe_webhook(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    settings = get_settings()
+    if not settings.stripe_webhook_secret:
+        return _coded(503, "stripe_unconfigured", "webhook not configured")
+
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, settings.stripe_webhook_secret)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid_signature"})
+
+    if event["type"] == "checkout.session.completed":
+        obj = event["data"]["object"]
+        sess_id = obj.get("id")
+        org_id = (obj.get("metadata") or {}).get("org_id")
+        amount = int(obj.get("amount_total") or 0)
+        paid = obj.get("payment_status") == "paid"
+        if paid and org_id and amount > 0 and sess_id:
+            # Idempotency: exactly one credit per checkout session, even if
+            # Stripe retries the webhook.
+            already = (
+                await session.execute(
+                    select(Transaction).where(
+                        Transaction.reference_type == "stripe_checkout",
+                        Transaction.reference_id == sess_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if already is None:
+                org = await session.get(Organization, uuid.UUID(org_id))
+                if org is not None:
+                    org.balance_cents += amount
+                    session.add(
+                        Transaction(
+                            org_id=org.id,
+                            kind="advertiser_deposit",
+                            amount_cents=amount,
+                            reference_type="stripe_checkout",
+                            reference_id=sess_id,
+                            metadata_={"payment_intent": obj.get("payment_intent")},
+                        )
+                    )
+                    await session.flush()
+                    log.info(
+                        "stripe_deposit_credited",
+                        org=org.slug,
+                        amount_cents=amount,
+                        session_id=sess_id,
+                    )
+
+    return {"received": True}
 
 
 # --- shared scoped-campaign loader (for pause/resume) ------------------------

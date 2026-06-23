@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     # modern ES256/RS256-signed session tokens. Read directly in supabase_auth.py.
     supabase_url: str = ""
 
+    # --- Stripe (advertiser payments) -----------------------------------------
+    # Secret key: sk_test_… in test mode, sk_live_… in prod. Empty disables the
+    # payment endpoints (they return 503) so dev works without Stripe configured.
+    stripe_secret_key: str = ""
+    # Signing secret for /advertiser/v1/stripe/webhook (whsec_…), from the
+    # Stripe dashboard webhook endpoint.
+    stripe_webhook_secret: str = ""
+    # Advertiser web-app base URL, used for Checkout success/cancel return links.
+    web_app_url: str = "https://app.kovio.dev"
+
     # --- Spend processor -------------------------------------------------------
     spend_processor_enabled: bool = True
     spend_processor_interval_seconds: int = 60
