@@ -867,10 +867,13 @@ async def update_display(
         if body.status not in ("active", "paused"):
             return _coded(422, "bad_status", "status must be 'active' or 'paused'")
         d.status = body.status
-    if body.fleet_id is not None:
-        _, ferr = await _scoped_fleet(body.fleet_id, org, session)
-        if ferr is not None:
-            return ferr
+    # "fleet_id" present in the request (even as null) means set it; absent means
+    # leave unchanged — so an operator can both connect and disconnect a fleet.
+    if "fleet_id" in body.model_fields_set:
+        if body.fleet_id is not None:
+            _, ferr = await _scoped_fleet(body.fleet_id, org, session)
+            if ferr is not None:
+                return ferr
         d.fleet_id = body.fleet_id
     # Set updated_at explicitly: relying on the column's SQL onupdate expires the
     # attribute after the UPDATE flush, which would force a sync lazy-load (IO) in
