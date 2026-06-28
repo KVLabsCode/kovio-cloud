@@ -28,6 +28,10 @@ services:
       KOVIO_ENVIRONMENT: dev
       KOVIO_KEY_PEPPER: kovio-dev-pepper-change-in-prod
       KOVIO_SUPABASE_JWT_SECRET: local-test-secret
+      # Verify real Supabase (ES256) session JWTs against the project's JWKS so a
+      # browser login on localhost works against this local API. HS256 secret
+      # above stays as a fallback for synthetic test tokens.
+      KOVIO_SUPABASE_URL: https://acughqaekwknfowlntcl.supabase.co
 
 volumes:
   kovio_pgdata:

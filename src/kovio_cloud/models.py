@@ -489,3 +489,85 @@ class Payout(Base):
     )
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
+
+
+# =====================================================================
+# 13. custom_displays — OEM-owned standalone "custom displays".
+#     A fleet operator uploads creative(s) for one of their own sourced
+#     advertisers and points a robot screen at /display/<code>, which loops the
+#     items full-screen. Standalone from paid campaigns (no budget/QR/Stripe).
+#     Added in migration 006_custom_displays.
+# =====================================================================
+class CustomDisplay(Base):
+    __tablename__ = "custom_displays"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'paused')", name="custom_displays_status_check"
+        ),
+        Index("ix_custom_displays_org", "org_id"),
+        Index("ix_custom_displays_code", "code"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Optional association to one of the OEM's fleets (informational for now).
+    fleet_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("fleets.id", ondelete="SET NULL")
+    )
+    # Short public slug used in the robot-facing URL /display/<code>.
+    code: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # The OEM's own sourced advertiser this display is for.
+    advertiser_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'active'"), default="active"
+    )
+    # Default seconds an IMAGE item is shown when it carries no per-item duration.
+    default_image_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("8"), default=8
+    )
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+    items: Mapped[list["CustomDisplayItem"]] = relationship(
+        back_populates="display",
+        cascade="all, delete-orphan",
+        order_by="CustomDisplayItem.position",
+    )
+
+
+# =====================================================================
+# 14. custom_display_items — ordered creatives in a custom display's playlist.
+# =====================================================================
+class CustomDisplayItem(Base):
+    __tablename__ = "custom_display_items"
+    __table_args__ = (
+        CheckConstraint(
+            "media_type IN ('image', 'video')",
+            name="custom_display_items_media_type_check",
+        ),
+        Index("ix_custom_display_items_display", "display_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    display_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("custom_displays.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Public media URL (Supabase Storage 'creatives' bucket).
+    media_url: Mapped[str] = mapped_column(Text, nullable=False)
+    media_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    # Seconds to show an image; NULL => use the display's default. Videos ignore
+    # this and play to their natural end.
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0
+    )
+    created_at: Mapped[datetime] = _created_at()
+
+    display: Mapped["CustomDisplay"] = relationship(back_populates="items")

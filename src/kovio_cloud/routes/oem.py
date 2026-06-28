@@ -10,6 +10,9 @@ API-key SECRETS are returned only by the mint endpoint, exactly once.
 
 from __future__ import annotations
 
+import re
+import secrets
+import string
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -17,14 +20,24 @@ from typing import Any
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..audience import audience_summary
 from ..auth import generate_api_key
 from ..db import get_session
-from ..models import ApiKey, Campaign, Fleet, Impression, Organization, Robot, User
+from ..models import (
+    ApiKey,
+    Campaign,
+    CustomDisplay,
+    CustomDisplayItem,
+    Fleet,
+    Impression,
+    Organization,
+    Robot,
+    User,
+)
 from ..supabase_auth import SupabaseUser, require_supabase_user
 
 router = APIRouter(prefix="/oem/v1", tags=["oem"])
@@ -617,6 +630,310 @@ async def revoke_api_key(
     if key.revoked_at is None:
         key.revoked_at = datetime.now(timezone.utc)
         await session.flush()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# =============================================================================
+# Custom displays — OEM uploads creative(s) for one of their own sourced
+# advertisers and points a robot screen at /display/<code> (looped full-screen).
+# Standalone from paid campaigns. See models.CustomDisplay / CustomDisplayItem.
+# =============================================================================
+_CODE_ALPHABET = string.ascii_lowercase + string.digits
+_VIDEO_RE = re.compile(r"\.(mp4|webm|mov|m4v)(\?|#|$)", re.IGNORECASE)
+
+
+def _gen_code(n: int = 8) -> str:
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(n))
+
+
+def _infer_media_type(url: str) -> str:
+    return "video" if _VIDEO_RE.search(url or "") else "image"
+
+
+def _display_item_dict(it: CustomDisplayItem) -> dict[str, Any]:
+    return {
+        "id": str(it.id),
+        "media_url": it.media_url,
+        "media_type": it.media_type,
+        "duration_seconds": it.duration_seconds,
+        "position": it.position,
+    }
+
+
+def _display_dict(
+    d: CustomDisplay,
+    *,
+    item_count: int | None = None,
+    items: list[CustomDisplayItem] | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "id": str(d.id),
+        "code": d.code,
+        "public_path": f"/display/{d.code}",
+        "name": d.name,
+        "advertiser_name": d.advertiser_name,
+        "fleet_id": str(d.fleet_id) if d.fleet_id else None,
+        "status": d.status,
+        "default_image_seconds": d.default_image_seconds,
+        "created_at": d.created_at,
+        "updated_at": d.updated_at,
+    }
+    if item_count is not None:
+        out["item_count"] = item_count
+    if items is not None:
+        out["items"] = [_display_item_dict(it) for it in items]
+    return out
+
+
+def _build_items(items: list["DisplayItemBody"]) -> list[CustomDisplayItem]:
+    built: list[CustomDisplayItem] = []
+    for i, it in enumerate(items):
+        mtype = (it.media_type or _infer_media_type(it.media_url)).lower()
+        if mtype not in ("image", "video"):
+            mtype = _infer_media_type(it.media_url)
+        dur = it.duration_seconds
+        if dur is not None:
+            dur = max(1, min(int(dur), 600))
+        built.append(
+            CustomDisplayItem(
+                media_url=it.media_url,
+                media_type=mtype,
+                duration_seconds=dur,
+                position=i,
+            )
+        )
+    return built
+
+
+async def _scoped_display(
+    display_pk: uuid.UUID, org: Organization, session: AsyncSession
+) -> tuple[CustomDisplay | None, JSONResponse | None]:
+    d = (
+        await session.execute(select(CustomDisplay).where(CustomDisplay.id == display_pk))
+    ).scalar_one_or_none()
+    if d is None or d.org_id != org.id:
+        return None, _coded(404, "not_found", "display not found")
+    return d, None
+
+
+async def _unique_code(session: AsyncSession) -> str:
+    for _ in range(6):
+        code = _gen_code()
+        exists = (
+            await session.execute(select(CustomDisplay.id).where(CustomDisplay.code == code))
+        ).first()
+        if not exists:
+            return code
+    return _gen_code(12)  # vanishingly unlikely; longer code as a fallback
+
+
+class DisplayItemBody(BaseModel):
+    media_url: str
+    media_type: str | None = None  # inferred from the URL when omitted
+    duration_seconds: int | None = None
+
+
+class DisplayCreateBody(BaseModel):
+    name: str
+    advertiser_name: str | None = None
+    fleet_id: uuid.UUID | None = None
+    default_image_seconds: int | None = None
+    items: list[DisplayItemBody] = []
+
+
+class DisplayPatchBody(BaseModel):
+    name: str | None = None
+    advertiser_name: str | None = None
+    fleet_id: uuid.UUID | None = None
+    status: str | None = None
+    default_image_seconds: int | None = None
+
+
+class DisplayItemsBody(BaseModel):
+    items: list[DisplayItemBody] = []
+
+
+# --- GET /displays -----------------------------------------------------------
+@router.get("/displays")
+async def list_displays(
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    rows = (
+        await session.execute(
+            select(CustomDisplay)
+            .where(CustomDisplay.org_id == org.id)
+            .order_by(CustomDisplay.created_at.desc())
+        )
+    ).scalars().all()
+    counts: dict[uuid.UUID, int] = {}
+    if rows:
+        count_rows = (
+            await session.execute(
+                select(CustomDisplayItem.display_id, func.count())
+                .where(CustomDisplayItem.display_id.in_([d.id for d in rows]))
+                .group_by(CustomDisplayItem.display_id)
+            )
+        ).all()
+        counts = {r[0]: int(r[1]) for r in count_rows}
+    return {"displays": [_display_dict(d, item_count=counts.get(d.id, 0)) for d in rows]}
+
+
+# --- POST /displays ----------------------------------------------------------
+@router.post("/displays", status_code=status.HTTP_201_CREATED)
+async def create_display(
+    body: DisplayCreateBody,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    if body.fleet_id is not None:
+        _, ferr = await _scoped_fleet(body.fleet_id, org, session)
+        if ferr is not None:
+            return ferr
+    if not (body.name or "").strip():
+        return _coded(422, "name_required", "a display name is required")
+
+    d = CustomDisplay(
+        org_id=org.id,
+        fleet_id=body.fleet_id,
+        code=await _unique_code(session),
+        name=body.name.strip(),
+        advertiser_name=(body.advertiser_name or None),
+        default_image_seconds=max(1, min(body.default_image_seconds or 8, 600)),
+    )
+    items = _build_items(body.items)
+    d.items = items
+    session.add(d)
+    await session.flush()
+    return JSONResponse(
+        status_code=201,
+        content=_jsonable(_display_dict(d, item_count=len(items), items=items)),
+    )
+
+
+# --- GET /displays/{id} ------------------------------------------------------
+@router.get("/displays/{display_pk}")
+async def display_detail(
+    display_pk: uuid.UUID,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+    items = (
+        await session.execute(
+            select(CustomDisplayItem)
+            .where(CustomDisplayItem.display_id == d.id)
+            .order_by(CustomDisplayItem.position)
+        )
+    ).scalars().all()
+    return _display_dict(d, item_count=len(items), items=items)
+
+
+# --- PATCH /displays/{id} ----------------------------------------------------
+@router.patch("/displays/{display_pk}")
+async def update_display(
+    display_pk: uuid.UUID,
+    body: DisplayPatchBody,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+
+    if body.name is not None:
+        if not body.name.strip():
+            return _coded(422, "name_required", "a display name is required")
+        d.name = body.name.strip()
+    if body.advertiser_name is not None:
+        d.advertiser_name = body.advertiser_name or None
+    if body.default_image_seconds is not None:
+        d.default_image_seconds = max(1, min(body.default_image_seconds, 600))
+    if body.status is not None:
+        if body.status not in ("active", "paused"):
+            return _coded(422, "bad_status", "status must be 'active' or 'paused'")
+        d.status = body.status
+    if body.fleet_id is not None:
+        _, ferr = await _scoped_fleet(body.fleet_id, org, session)
+        if ferr is not None:
+            return ferr
+        d.fleet_id = body.fleet_id
+    # Set updated_at explicitly: relying on the column's SQL onupdate expires the
+    # attribute after the UPDATE flush, which would force a sync lazy-load (IO) in
+    # this async context (MissingGreenlet) when _display_dict reads it back.
+    d.updated_at = datetime.now(timezone.utc)
+    await session.flush()
+
+    count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(CustomDisplayItem)
+                .where(CustomDisplayItem.display_id == d.id)
+            )
+        ).scalar_one()
+    )
+    return JSONResponse(content=_jsonable(_display_dict(d, item_count=count)))
+
+
+# --- PUT /displays/{id}/items (replace the whole playlist) -------------------
+@router.put("/displays/{display_pk}/items")
+async def replace_display_items(
+    display_pk: uuid.UUID,
+    body: DisplayItemsBody,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+
+    await session.execute(
+        delete(CustomDisplayItem).where(CustomDisplayItem.display_id == d.id)
+    )
+    items = _build_items(body.items)
+    for it in items:
+        it.display_id = d.id
+        session.add(it)
+    d.updated_at = datetime.now(timezone.utc)
+    await session.flush()
+    return JSONResponse(
+        content=_jsonable(_display_dict(d, item_count=len(items), items=items))
+    )
+
+
+# --- DELETE /displays/{id} ---------------------------------------------------
+@router.delete("/displays/{display_pk}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_display(
+    display_pk: uuid.UUID,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+    # DB-level ON DELETE CASCADE removes the items.
+    await session.execute(delete(CustomDisplay).where(CustomDisplay.id == d.id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

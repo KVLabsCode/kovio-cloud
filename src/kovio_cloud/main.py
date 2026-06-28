@@ -13,7 +13,7 @@ from sqlalchemy import text
 from . import __version__
 from .config import get_settings
 from .db import dispose_engine, get_logger, get_sessionmaker, init_db
-from .routes import admin, advertiser, oem, sdk
+from .routes import admin, advertiser, display, oem, sdk
 from .schemas import HealthResponse
 from .spend_processor import spend_processor_loop
 
@@ -77,6 +77,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(advertiser.router)
     app.include_router(oem.router)
+    app.include_router(display.router)
 
     @app.get("/healthz", response_model=HealthResponse, tags=["meta"])
     async def healthz() -> HealthResponse:
