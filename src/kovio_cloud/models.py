@@ -330,6 +330,27 @@ class Impression(Base):
     # concurrent ``scene_observed`` LiDAR sample (``mean_distance_m``). NULL when
     # no scene was available — the audience summary surfaces that as "—".
     min_distance_m: Mapped[float | None] = mapped_column(Numeric(6, 2))
+
+    # --- Enriched perception metrics (migration 007, INSIGHT-ONLY) ------------
+    # All correlated from the concurrent scene_observed / interaction_observed
+    # events at cost time. Never priced in v1 — reporting, funnel and targeting.
+    looked_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0
+    )  # people whose gaze was on the screen
+    mean_dwell_s: Mapped[float | None] = mapped_column(Numeric(6, 2))  # avg dwell, fills the dashboard stub
+    people_nearby: Mapped[int | None] = mapped_column(Integer)         # lidar crowd within radius
+    crowd_density: Mapped[float | None] = mapped_column(Numeric(8, 4))  # people / m^2
+    nearest_distance_m: Mapped[float | None] = mapped_column(Numeric(6, 2))  # lidar nearest body
+    phones_out: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0
+    )  # people who had a phone out
+    interactions: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0
+    )  # total discrete interactions in the window
+    interaction_breakdown: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"), default=dict
+    )  # {kind: count} e.g. {"handshake": 2, "wave": 5, "phone_out": 1}
+
     # Money split for this single impression
     cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     revenue_to_oem_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)

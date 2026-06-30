@@ -34,22 +34,75 @@ async def audience_summary(session: AsyncSession, *conditions: Any) -> dict[str,
                 func.coalesce(func.avg(Impression.person_count), 0).label("avg_reach"),
                 func.coalesce(func.max(Impression.person_count), 0).label("peak_reach"),
                 func.coalesce(func.avg(Impression.attended_count), 0).label("avg_attended"),
-                func.min(Impression.min_distance_m).label("nearest_m"),
+                # nearest approach: best (smallest) of depth-cam mean & lidar nearest
+                func.least(
+                    func.min(Impression.min_distance_m),
+                    func.min(Impression.nearest_distance_m),
+                ).label("nearest_m"),
+                # dwell — avg ignores NULLs, so this is the real mean over rows
+                # that carried dwell; None when none did (rendered as the sentinel).
+                func.avg(Impression.mean_dwell_s).label("avg_dwell_s"),
+                # crowd (lidar)
+                func.avg(Impression.people_nearby).label("avg_people_nearby"),
+                func.max(Impression.people_nearby).label("peak_people_nearby"),
+                # funnel totals
+                func.coalesce(func.sum(Impression.person_count), 0).label("total_reach"),
+                func.coalesce(func.sum(Impression.looked_count), 0).label("total_looked"),
+                func.coalesce(func.sum(Impression.phones_out), 0).label("total_phones_out"),
+                func.coalesce(func.sum(Impression.interactions), 0).label("total_interactions"),
             ).where(*conditions)
         )
     ).one()
 
     nearest = row.nearest_m
+    dwell = row.avg_dwell_s
+    avg_nearby = row.avg_people_nearby
+    peak_nearby = row.peak_people_nearby
+    total_reach = int(row.total_reach)
+    total_looked = int(row.total_looked)
+
     return {
         "samples": int(row.samples),
         "avg_reach": round(float(row.avg_reach), 1),
         "peak_reach": int(row.peak_reach),
         "avg_attended": round(float(row.avg_attended), 1),
-        # No dwell column yet: avg_dwell_s=0.0 is a SENTINEL meaning "no data",
-        # not a measured zero. Consumers MUST guard on the value (avg_dwell_s > 0
-        # ? ... : "—"), NOT on `samples`, which can be > 0 while dwell is absent.
-        "avg_dwell_s": 0.0,
-        # Closest recorded approach (metres) across the window's impressions;
-        # None when no impression carried LiDAR proximity data -> UI shows "—".
+        # Real dwell now (migration 007). avg_dwell_s=0.0 stays a SENTINEL for
+        # "no data" — consumers MUST guard on the value (> 0 ? ... : "—"), NOT on
+        # `samples`, which can be > 0 while dwell is absent on basic adapters.
+        "avg_dwell_s": round(float(dwell), 1) if dwell is not None else 0.0,
+        # Closest recorded approach (metres); None when no proximity data -> "—".
         "nearest_m": round(float(nearest), 1) if nearest is not None else None,
+        # --- crowd (lidar wide FOV) ---
+        "avg_people_nearby": round(float(avg_nearby), 1) if avg_nearby is not None else None,
+        "peak_people_nearby": int(peak_nearby) if peak_nearby is not None else None,
+        # --- engagement funnel: reach -> looked -> phone-out -> interactions ---
+        "total_reach": total_reach,
+        "total_looked": total_looked,
+        "look_rate": round(total_looked / total_reach, 3) if total_reach > 0 else None,
+        "total_phones_out": int(row.total_phones_out),
+        "total_interactions": int(row.total_interactions),
+        "interaction_breakdown": await _interaction_breakdown(session, *conditions),
     }
+
+
+async def _interaction_breakdown(session: AsyncSession, *conditions: Any) -> dict[str, int]:
+    """Sum each impression's ``interaction_breakdown`` JSONB into {kind: count}.
+
+    Only rows that recorded interactions are read (``interactions > 0``), which
+    keeps the set small, then the per-kind dicts are merged in Python. Returns {}
+    when no interactions occurred in the window.
+    """
+    rows = (
+        await session.execute(
+            select(Impression.interaction_breakdown).where(
+                *conditions, Impression.interactions > 0
+            )
+        )
+    ).scalars().all()
+    out: dict[str, int] = {}
+    for bd in rows:
+        if not bd:
+            continue
+        for kind, count in dict(bd).items():
+            out[kind] = out.get(kind, 0) + int(count)
+    return out

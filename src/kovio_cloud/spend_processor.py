@@ -49,7 +49,11 @@ async def _scene_for_event(session: AsyncSession, event: EventRaw) -> dict:
     scene is available — robot unknown, or no sample within ``_SCENE_WINDOW``.
     """
 
-    empty = {"person": 0, "attended": 0, "mean_distance_m": None}
+    empty = {
+        "person": 0, "attended": 0, "mean_distance_m": None,
+        "looked": 0, "mean_dwell_s": None, "people_nearby": None,
+        "crowd_density": None, "nearest_distance_m": None,
+    }
     if event.robot_id is None:
         return empty
     payload = (
@@ -72,6 +76,44 @@ async def _scene_for_event(session: AsyncSession, event: EventRaw) -> dict:
         "person": int(p.get("person_count", 0) or 0),
         "attended": int(p.get("attended_count", 0) or 0),
         "mean_distance_m": p.get("mean_distance_m"),
+        # enriched fields — absent on basic adapters, so default to neutral
+        "looked": int(p.get("looked_count", 0) or 0),
+        "mean_dwell_s": p.get("mean_dwell_s"),
+        "people_nearby": p.get("people_nearby"),
+        "crowd_density": p.get("crowd_density"),
+        "nearest_distance_m": p.get("nearest_distance_m"),
+    }
+
+
+async def _interactions_for_event(session: AsyncSession, event: EventRaw) -> dict:
+    """Count discrete ``interaction_observed`` events concurrent with an ad.
+
+    Same robot + window as the scene correlation. Returns the total plus a
+    per-kind breakdown (``{"handshake": 2, "wave": 5, ...}``) and the number of
+    people who had a phone out (the ``phone_out`` kind). Insight-only — these
+    feed the engagement funnel, never the cost.
+    """
+    blank = {"total": 0, "breakdown": {}, "phones_out": 0}
+    if event.robot_id is None:
+        return blank
+    rows = (
+        await session.execute(
+            select(EventRaw.payload).where(
+                EventRaw.robot_id == event.robot_id,
+                EventRaw.event_type == "interaction_observed",
+                EventRaw.timestamp <= event.timestamp,
+                EventRaw.timestamp >= event.timestamp - _SCENE_WINDOW,
+            )
+        )
+    ).scalars().all()
+    breakdown: dict[str, int] = {}
+    for payload in rows:
+        kind = str((payload or {}).get("kind", "other"))
+        breakdown[kind] = breakdown.get(kind, 0) + 1
+    return {
+        "total": len(rows),
+        "breakdown": breakdown,
+        "phones_out": breakdown.get("phone_out", 0),
     }
 
 
@@ -160,6 +202,8 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
             attended = int(payload.get("attended_count", scene["attended"]) or 0)
             person = int(payload.get("person_count", scene["person"]) or 0)
             min_distance_m = payload.get("mean_distance_m", scene["mean_distance_m"])
+            # Enriched, insight-only audience metrics (None/0 on basic adapters).
+            ix = await _interactions_for_event(session, event)
 
             # --- Gross cost: the campaign's real price for this impression. Used
             # for budget accounting for EVERY campaign (incl. promos), so the
@@ -219,6 +263,14 @@ async def process_pending_events(session: AsyncSession, limit: int = 1000) -> di
                 person_count=person,
                 attended_count=attended,
                 min_distance_m=min_distance_m,
+                looked_count=int(scene["looked"] or 0),
+                mean_dwell_s=scene["mean_dwell_s"],
+                people_nearby=scene["people_nearby"],
+                crowd_density=scene["crowd_density"],
+                nearest_distance_m=scene["nearest_distance_m"],
+                phones_out=int(ix["phones_out"] or 0),
+                interactions=int(ix["total"] or 0),
+                interaction_breakdown=ix["breakdown"],
                 cost_cents=charge_cents,
                 revenue_to_oem_cents=revenue_to_oem_cents,
                 kovio_share_cents=kovio_share_cents,
