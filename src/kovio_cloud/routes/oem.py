@@ -20,18 +20,24 @@ from typing import Any
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..audience import audience_summary
 from ..auth import generate_api_key
 from ..db import get_session
+from ..display_insights import (
+    active_assignments,
+    display_summary,
+    recent_display_events,
+)
 from ..models import (
     ApiKey,
     Campaign,
     CustomDisplay,
     CustomDisplayItem,
+    DisplayAssignment,
     Fleet,
     Impression,
     Organization,
@@ -944,3 +950,216 @@ def _jsonable(obj: dict[str, Any]) -> dict[str, Any]:
     from fastapi.encoders import jsonable_encoder
 
     return jsonable_encoder(obj)
+
+
+# =============================================================================
+# Custom-display interaction metrics — attribute the perception events the robot
+# already streams to a display, by assigning displays to robots over time. The
+# live view joins events_raw to these assignments (see display_insights.py).
+# Insight-only: no budget, no cost, no impressions row.
+# =============================================================================
+class DisplayAssignBody(BaseModel):
+    # Provide robot_ids and/or fleet_id. fleet_id fans out to every robot in the
+    # fleet. For unassign, an empty body means "all robots showing this display".
+    robot_ids: list[uuid.UUID] | None = None
+    fleet_id: uuid.UUID | None = None
+
+
+async def _resolve_org_robots(
+    org: Organization,
+    session: AsyncSession,
+    robot_ids: list[uuid.UUID] | None,
+    fleet_id: uuid.UUID | None,
+) -> tuple[set[uuid.UUID] | None, JSONResponse | None]:
+    """Validate that every targeted robot belongs to one of the OEM's fleets.
+
+    Returns the resolved robot id set, or a 404 if a fleet/robot isn't theirs.
+    """
+    ids: set[uuid.UUID] = set()
+    if fleet_id is not None:
+        fleet, ferr = await _scoped_fleet(fleet_id, org, session)
+        if ferr is not None:
+            return None, ferr
+        rows = (
+            await session.execute(select(Robot.id).where(Robot.fleet_id == fleet.id))
+        ).scalars().all()
+        ids.update(rows)
+    if robot_ids:
+        valid = set(
+            (
+                await session.execute(
+                    select(Robot.id)
+                    .join(Fleet, Robot.fleet_id == Fleet.id)
+                    .where(Robot.id.in_(robot_ids), Fleet.org_id == org.id)
+                )
+            ).scalars().all()
+        )
+        missing = set(robot_ids) - valid
+        if missing:
+            return None, _coded(
+                404, "robot_not_found", "one or more robots are not in your fleets"
+            )
+        ids.update(valid)
+    return ids, None
+
+
+# --- POST /displays/{id}/assign ----------------------------------------------
+@router.post("/displays/{display_pk}/assign")
+async def assign_display(
+    display_pk: uuid.UUID,
+    body: DisplayAssignBody,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Show this display on the given robots. Close-then-open per robot keeps the
+    single-open-assignment invariant, so attribution at the switch is unambiguous."""
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+    robots, rerr = await _resolve_org_robots(org, session, body.robot_ids, body.fleet_id)
+    if rerr is not None:
+        return rerr
+    if not robots:
+        return _coded(422, "no_targets", "provide robot_ids or fleet_id")
+
+    now = datetime.now(timezone.utc)
+    for rid in robots:
+        # Close any open assignment for this robot (any display) first, so the
+        # partial-unique-open invariant holds and there is no overlap.
+        await session.execute(
+            update(DisplayAssignment)
+            .where(
+                DisplayAssignment.robot_id == rid,
+                DisplayAssignment.effective_to.is_(None),
+            )
+            .values(effective_to=now)
+        )
+        session.add(
+            DisplayAssignment(display_id=d.id, robot_id=rid, effective_from=now)
+        )
+        await session.flush()  # ensure the close precedes the open per robot
+
+    return {"assigned": len(robots), "active": await active_assignments(session, d.id)}
+
+
+# --- POST /displays/{id}/unassign --------------------------------------------
+@router.post("/displays/{display_pk}/unassign")
+async def unassign_display(
+    display_pk: uuid.UUID,
+    body: DisplayAssignBody,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stop showing this display. Empty body unassigns all robots showing it."""
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+
+    conds = [
+        DisplayAssignment.display_id == d.id,
+        DisplayAssignment.effective_to.is_(None),
+    ]
+    if body.robot_ids or body.fleet_id:
+        robots, rerr = await _resolve_org_robots(
+            org, session, body.robot_ids, body.fleet_id
+        )
+        if rerr is not None:
+            return rerr
+        conds.append(DisplayAssignment.robot_id.in_(robots))
+
+    res = await session.execute(
+        update(DisplayAssignment)
+        .where(*conds)
+        .values(effective_to=datetime.now(timezone.utc))
+    )
+    return {
+        "unassigned": res.rowcount,
+        "active": await active_assignments(session, d.id),
+    }
+
+
+# --- GET /displays/{id}/assignments ------------------------------------------
+@router.get("/displays/{display_pk}/assignments")
+async def list_display_assignments(
+    display_pk: uuid.UUID,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+    return JSONResponse(
+        content=_jsonable({"active": await active_assignments(session, d.id)})
+    )
+
+
+# --- GET /displays/{id}/metrics — lifetime/window summary for page load -------
+@router.get("/displays/{display_pk}/metrics")
+async def display_metrics(
+    display_pk: uuid.UUID,
+    days: int = 30,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+    days = max(1, min(days, 365))
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    summary = await display_summary(session, d.id, start, end)
+    return JSONResponse(
+        content=_jsonable(
+            {
+                "days": days,
+                "summary": summary,
+                "active": await active_assignments(session, d.id),
+            }
+        )
+    )
+
+
+# --- GET /displays/{id}/live — recent-window summary + event feed (polled) ----
+@router.get("/displays/{display_pk}/live")
+async def display_live(
+    display_pk: uuid.UUID,
+    window_minutes: int = 5,
+    supa: SupabaseUser = Depends(require_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Real replacement for the synthetic Hawkeye: attributed metrics + event
+    feed over the recent window. The web polls this every few seconds."""
+    _, org, err = await _oem_context(supa, session)
+    if err is not None:
+        return err
+    d, derr = await _scoped_display(display_pk, org, session)
+    if derr is not None:
+        return derr
+    window_minutes = max(1, min(window_minutes, 60))
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=window_minutes)
+    summary = await display_summary(session, d.id, start, end)
+    events = await recent_display_events(session, d.id, start, end, limit=20)
+    return JSONResponse(
+        content=_jsonable(
+            {
+                "window_minutes": window_minutes,
+                "summary": summary,
+                "events": events,
+                "active": await active_assignments(session, d.id),
+            }
+        ),
+        headers={"Cache-Control": "no-store"},
+    )

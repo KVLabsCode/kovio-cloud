@@ -592,3 +592,51 @@ class CustomDisplayItem(Base):
     created_at: Mapped[datetime] = _created_at()
 
     display: Mapped["CustomDisplay"] = relationship(back_populates="items")
+
+
+# =====================================================================
+# 15. display_assignments — which robot is showing which custom display, over
+#     time. The "which campaign is playing, and where" binding. Insight-only:
+#     the perception events the robot already streams (scene_observed /
+#     interaction_observed, each carrying robot_id + timestamp on events_raw)
+#     are attributed to a display by joining on robot_id + the time interval.
+#     No spend processor, no cost, no impressions row. See migration 008.
+# =====================================================================
+class DisplayAssignment(Base):
+    __tablename__ = "display_assignments"
+    __table_args__ = (
+        CheckConstraint(
+            "effective_to IS NULL OR effective_to > effective_from",
+            name="display_assignments_interval_check",
+        ),
+        Index("ix_display_assignments_robot", "robot_id", text("effective_from DESC")),
+        Index("ix_display_assignments_display", "display_id", text("effective_from DESC")),
+        # At most one OPEN assignment per robot — a robot is never ambiguously
+        # showing two displays at once.
+        Index(
+            "ux_display_assignments_open_robot",
+            "robot_id",
+            unique=True,
+            postgresql_where=text("effective_to IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    display_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("custom_displays.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    robot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("robots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Half-open interval [effective_from, effective_to). effective_to NULL = still
+    # active. An event at time T belongs here when
+    # effective_from <= T AND (effective_to IS NULL OR T < effective_to).
+    effective_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created_at()
