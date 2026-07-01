@@ -30,6 +30,7 @@ from ..db import get_session
 from ..display_insights import (
     active_assignments,
     display_summary,
+    latest_radar,
     recent_display_events,
 )
 from ..models import (
@@ -1152,12 +1153,14 @@ async def display_live(
     start = end - timedelta(minutes=window_minutes)
     summary = await display_summary(session, d.id, start, end)
     events = await recent_display_events(session, d.id, start, end, limit=20)
+    radar = await latest_radar(session, d.id, start, end)
     return JSONResponse(
         content=_jsonable(
             {
                 "window_minutes": window_minutes,
                 "summary": summary,
                 "events": events,
+                "radar": radar,
                 "active": await active_assignments(session, d.id),
             }
         ),

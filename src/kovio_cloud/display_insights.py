@@ -80,6 +80,9 @@ async def display_summary(
                 func.max(_int("people_nearby")).label("peak_people_nearby"),
                 func.coalesce(func.sum(_int("person_count")), 0).label("total_reach"),
                 func.coalesce(func.sum(_int("looked_count")), 0).label("total_looked"),
+                # unique bodies that ENTERED the lidar field, summed across ticks
+                # (the SDK counts each person once on entry) -> "people passed by".
+                func.coalesce(func.sum(_int("lidar_passed")), 0).label("total_passed_lidar"),
             )
             .select_from(join)
             .where(EventRaw.event_type == "scene_observed")
@@ -96,9 +99,14 @@ async def display_summary(
     peak_nearby = scene_row.peak_people_nearby
     total_reach = int(scene_row.total_reach)
     total_looked = int(scene_row.total_looked)
+    total_passed_lidar = int(scene_row.total_passed_lidar)
 
     return {
         "samples": int(scene_row.samples),
+        # unique "people passed by" from the lidar's wide field of view; distinct
+        # from total_reach (a per-frame camera sum). 0 until a lidar-equipped
+        # robot streams — the camera metrics stand alone until then.
+        "total_passed_lidar": total_passed_lidar,
         "avg_reach": round(float(scene_row.avg_reach), 1),
         "peak_reach": int(scene_row.peak_reach),
         "avg_attended": round(float(scene_row.avg_attended), 1),
@@ -177,6 +185,51 @@ async def recent_display_events(
                 }
             )
     return out
+
+
+async def latest_radar(
+    session: AsyncSession, display_id: uuid.UUID, start: datetime, end: datetime
+) -> dict[str, Any] | None:
+    """The most recent attributed scene's lidar blips, for the live 360° radar.
+
+    Returns the newest ``scene_observed`` in the window that actually carries
+    ``lidar_people`` (a lidar-equipped robot) as ``{blips, people_nearby,
+    nearest_m, ts}``; ``blips`` is ``[[range_m, bearing_deg], ...]`` (bearing
+    0=front, +=right). ``None`` when no lidar frame exists — the UI then keeps
+    the radar idle rather than animating fake points.
+    """
+    join = EventRaw.__table__.join(
+        DisplayAssignment.__table__, _attributed_to(display_id, start, end)
+    )
+    row = (
+        await session.execute(
+            select(EventRaw.payload, EventRaw.timestamp)
+            .select_from(join)
+            .where(
+                EventRaw.event_type == "scene_observed",
+                EventRaw.payload.has_key("lidar_people"),  # noqa: W601 - JSONB ?
+            )
+            .order_by(EventRaw.timestamp.desc())
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return None
+    payload, ts = row
+    p = dict(payload or {})
+    blips = p.get("lidar_people") or []
+    # keep only well-formed [range, bearing] pairs; cap for a sane radar
+    clean = [
+        [float(b[0]), float(b[1])]
+        for b in blips
+        if isinstance(b, (list, tuple)) and len(b) >= 2
+    ][:32]
+    return {
+        "blips": clean,
+        "people_nearby": p.get("people_nearby"),
+        "nearest_m": p.get("nearest_distance_m"),
+        "ts": ts,
+    }
 
 
 async def active_assignments(
