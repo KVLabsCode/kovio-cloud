@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,8 @@ from .db import get_logger, session_scope
 from .models import (
     ApiKey,
     Campaign,
+    CustomDisplay,
+    DisplayAssignment,
     EventRaw,
     Fleet,
     Organization,
@@ -214,6 +217,49 @@ def bootstrap(
 # =====================================================================
 # seed-events  (dev/test: give the spend processor + dashboards real data)
 # =====================================================================
+
+# Lidar radius the SDK's LidarSource scans (adapters/lidar.py radius_m=4.0); the
+# density is bodies per m^2 within that disc, matching CrowdReading.
+_LIDAR_RADIUS_M = 4.0
+_LIDAR_DISC_AREA_M2 = math.pi * _LIDAR_RADIUS_M * _LIDAR_RADIUS_M
+
+
+def _scene_payload(person: int, attended: int, mean_distance_m: float, seed: int) -> dict:
+    """A ``scene_observed`` payload carrying realistic LiDAR fields, keyed EXACTLY
+    like ``SceneState.scalar_payload()`` in kovio-py (types.py) so the cloud's
+    attributed-events readers (``display_summary`` / ``latest_radar``) see the
+    same JSON a real robot streams.
+
+    ``lidar_people`` is a nearest-first list of ``[range_m, bearing_deg]`` blips
+    (range 0.8–4.0 m, bearing −90…+90, 0=front, +=right); the derived scalars
+    (``nearest_distance_m`` / ``approach_bearing_deg``) come from the nearest one.
+    """
+    # people_nearby (wide LiDAR FOV) is >= the camera's in-frame person_count.
+    k = max(1, min(person + 1, 6))
+    blips: list[list[float]] = []
+    for j in range(k):
+        rng = round(min(0.8 + j * 0.6 + (seed % 4) * 0.25, _LIDAR_RADIUS_M), 2)
+        bearing = round(-90 + ((seed * 41 + j * 57) % 181), 1)  # -90..+90
+        blips.append([rng, bearing])
+    blips.sort(key=lambda b: b[0])  # nearest first, as the SDK emits
+    nearest_range, nearest_bearing = blips[0]
+    return {
+        # --- depth-camera (original v0 contract) ---
+        "person_count": person,
+        "attended_count": attended,
+        "mean_distance_m": mean_distance_m,
+        "looked_count": attended,
+        "mean_dwell_s": round(1.4 + (seed % 5) * 0.5, 1),
+        # --- lidar: wide-FOV crowd & proximity + per-body radar blips ---
+        "people_nearby": k,
+        "crowd_density": round(k / _LIDAR_DISC_AREA_M2, 4),
+        "nearest_distance_m": nearest_range,
+        "approach_bearing_deg": nearest_bearing,
+        "lidar_people": blips,
+        "lidar_passed": 1 + (seed % 3),
+    }
+
+
 async def _seed_events(per_campaign: int) -> dict:
     """Emit paired scene_observed + ad_played events for the demo fleet so the
     spend processor produces impressions carrying real reach/attention/proximity,
@@ -261,7 +307,7 @@ async def _seed_events(per_campaign: int) -> dict:
                 dist = round(1.0 + ((i * 7 + ci * 3) % 40) / 10.0, 2)  # 1.0..4.9 m
                 _emit(
                     "scene_observed",
-                    {"person_count": person, "attended_count": attended, "mean_distance_m": dist},
+                    _scene_payload(person, attended, dist, seed=i * 3 + ci),
                     ts,
                 )
                 _emit(
@@ -315,11 +361,69 @@ async def _seed_events(per_campaign: int) -> dict:
             )
             created += 2
 
+        # --- Live radar burst: scene_observed events carrying LiDAR blips packed
+        # into the last ~3 minutes, so latest_radar's 5-minute live window always
+        # catches a fresh frame (the historical spread above is too old for it).
+        burst = 0
+        for i in range(12):
+            ts = now - timedelta(seconds=i * 15)  # 0..165 s ago, all within ~3 min
+            person = 1 + (i % 4)
+            attended = max(0, person - (i % 2))
+            dist = round(1.2 + (i % 5) * 0.3, 2)
+            _emit("scene_observed", _scene_payload(person, attended, dist, seed=i + 1), ts)
+            created += 1
+            burst += 1
+
+        # --- Bind the demo robot to a custom display so the attributed-events JOIN
+        # (display_assignments) resolves — without it, latest_radar/display_summary
+        # see none of these events and the live panel stays idle. Idempotent:
+        # reuse an existing display/open assignment on re-run. ------------------
+        display = (
+            await session.execute(
+                select(CustomDisplay).where(CustomDisplay.code == "demo-live")
+            )
+        ).scalar_one_or_none()
+        if display is None:
+            display = CustomDisplay(
+                org_id=fleet.org_id,
+                fleet_id=fleet.id,
+                code="demo-live",
+                name="Demo Live Panel",
+                advertiser_name="Kovio Demo",
+            )
+            session.add(display)
+            await session.flush()
+
+        # At most one OPEN assignment per robot (migration 008 partial-unique
+        # index), so only create one when the robot has none open yet.
+        open_assignment = (
+            await session.execute(
+                select(DisplayAssignment).where(
+                    DisplayAssignment.robot_id == robot.id,
+                    DisplayAssignment.effective_to.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if open_assignment is None:
+            session.add(
+                DisplayAssignment(
+                    display_id=display.id,
+                    robot_id=robot.id,
+                    # Well before the whole historical spread AND the burst, so
+                    # every emitted event falls inside this open interval.
+                    effective_from=now - timedelta(days=21),
+                    effective_to=None,
+                )
+            )
+
     return {
         "events_created": created,
         "paid_campaigns": len(campaigns),
         "promo_campaign": promo.campaign_id,
         "promo_advertiser_slug": promo_adv.slug,
+        "live_radar_burst": burst,
+        "display_code": display.code,
+        "display_id": str(display.id),
     }
 
 
@@ -334,6 +438,11 @@ def seed_events(
     result = asyncio.run(_seed_events(per_campaign))
     typer.secho(json.dumps(result, indent=2), fg=typer.colors.GREEN)
     typer.secho("Now run `process-spend` to cost these into impressions.", fg=typer.colors.CYAN)
+    typer.secho(
+        f"The OEM live panel for display '{result['display_code']}' now has a "
+        "LiDAR radar (scene_observed blips in the 5-min window).",
+        fg=typer.colors.CYAN,
+    )
 
 
 # =====================================================================
