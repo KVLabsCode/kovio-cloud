@@ -587,7 +587,7 @@ async def checkout(
                 {
                     "price_data": {
                         "currency": "usd",
-                        "product_data": {"name": f"Kovio ad credit — {org.name}"},
+                        "product_data": {"name": "Kovio Campaign"},
                         "unit_amount": body.amount_cents,
                     },
                     "quantity": 1,
