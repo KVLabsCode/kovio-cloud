@@ -200,3 +200,61 @@ class SpendRunResult(BaseModel):
     impressions_created: int
     campaigns_paused: list[str]
     advertisers_drained: list[str]
+
+
+# --- Sessions (admin live-view windows, migration 009) --------------------------
+class SessionRobotOut(BaseModel):
+    id: uuid.UUID
+    external_id: str
+    status: str
+    last_heartbeat: datetime | None
+    online: bool
+
+    model_config = {"from_attributes": True}
+
+
+class SessionRobotsResponse(BaseModel):
+    robots: list[SessionRobotOut]
+    online_threshold_seconds: int
+
+
+class SessionStartIn(BaseModel):
+    robot_id: uuid.UUID
+    display_id: uuid.UUID | None = None
+
+
+class SessionStopIn(BaseModel):
+    robot_id: uuid.UUID | None = None
+    session_id: uuid.UUID | None = None
+
+
+class SessionOut(BaseModel):
+    id: uuid.UUID
+    robot_id: uuid.UUID
+    fleet_id: uuid.UUID
+    org_id: uuid.UUID
+    display_id: uuid.UUID | None
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class SessionCurrentOut(BaseModel):
+    active: bool
+    session_id: uuid.UUID | None = None
+    started_at: datetime | None = None
+    frame_interval_seconds: int = 5
+
+
+class SessionSummaryOut(BaseModel):
+    session_id: uuid.UUID
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    impressions: int
+    person_count: int
+    attended_count: int
+    latest_campaign: str | None
+    last_frame_age_seconds: float | None

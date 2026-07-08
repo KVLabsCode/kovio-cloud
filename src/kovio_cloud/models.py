@@ -640,3 +640,56 @@ class DisplayAssignment(Base):
     )
     effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()
+
+
+# =====================================================================
+# 16. sessions — an admin start/stop recording window binding one robot (and
+#     optionally the custom display it is playing) to a live-view session. Only
+#     the binding lives here: frames are relayed in RAM, never persisted, and
+#     impressions/events are attributed by read-only timestamp-range queries
+#     over events_raw/impressions. Added in migration 009_sessions.
+# =====================================================================
+class Session(Base):
+    __tablename__ = "sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('recording', 'stopped')", name="sessions_status_check"
+        ),
+        CheckConstraint(
+            "ended_at IS NULL OR ended_at > started_at",
+            name="sessions_interval_check",
+        ),
+        Index("ix_sessions_robot_started", "robot_id", text("started_at DESC")),
+        # At most one OPEN session per robot; start closes the old one first.
+        Index(
+            "ux_sessions_open_robot",
+            "robot_id",
+            unique=True,
+            postgresql_where=text("ended_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    robot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("robots.id", ondelete="CASCADE"), nullable=False
+    )
+    fleet_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("fleets.id", ondelete="CASCADE"), nullable=False
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    display_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("custom_displays.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'recording'"), default="recording"
+    )
+    # Half-open window [started_at, ended_at). ended_at NULL = still recording.
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created_at()
