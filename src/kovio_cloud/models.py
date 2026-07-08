@@ -684,6 +684,16 @@ class Session(Base):
     display_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("custom_displays.id", ondelete="SET NULL")
     )
+    # Campaign binding asserted by the operator at Start (migration 010).
+    # Single-creative session: the campaign its metrics attribute to.
+    # Multi-creative (looping) session: NULL, and is_blended is TRUE — blended
+    # metrics stay display-scoped and must never carry a campaign_id.
+    campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id")
+    )
+    is_blended: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("FALSE"), default=False
+    )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default=text("'recording'"), default="recording"
     )
@@ -692,4 +702,88 @@ class Session(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created_at()
+
+
+# =====================================================================
+# 17. audience_samples — one row per audience MOMENT measured on-device by the
+#     V2 perception stack (LiDAR clustering/tracking + depth confirmation):
+#     metric_kind 'passerby' (entered 3 m, ≥1 s), 'dwell' (≤1.5 m for ≥3 s,
+#     tiered), 'close_approach' (depth <1 m with LiDAR coincidence). track_id
+#     is session-scoped and never re-identifying; unique reach = DISTINCT
+#     track_id. event_id is the robot's moment uuid (UNIQUE -> idempotent
+#     uploads). Insight-only: nothing here feeds spend/settlement.
+#     Table predates this build; migration 010 added the session/moment fields.
+# =====================================================================
+class AudienceSample(Base):
+    __tablename__ = "audience_samples"
+    __table_args__ = (
+        Index("ix_audience_samples_session", "session_id"),
+        Index("ix_audience_samples_campaign_ts", "campaign_id", text('"timestamp" DESC')),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), unique=True, nullable=False
+    )
+    moment_id: Mapped[str | None] = mapped_column(Text)
+    campaign_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    advertiser_org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    oem_org_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    fleet_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    robot_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reach: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0
+    )
+    attended: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0
+    )
+    nearest_m: Mapped[float] = mapped_column(
+        Numeric, nullable=False, server_default=text("0"), default=0
+    )
+    dwell_s: Mapped[float] = mapped_column(
+        Numeric, nullable=False, server_default=text("0"), default=0
+    )
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    # --- migration 010: session linkage + moment fields ---
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id")
+    )
+    track_id: Mapped[int | None] = mapped_column(BigInteger)
+    metric_kind: Mapped[str | None] = mapped_column(Text)
+    dwell_tier: Mapped[str | None] = mapped_column(Text)
+    camera_confirmed: Mapped[bool | None] = mapped_column(Boolean)
+    lidar_confirmed: Mapped[bool | None] = mapped_column(Boolean)
+
+
+# =====================================================================
+# 18. demo_creatives — reusable known-good creatives loadable into any custom
+#     display without re-uploading. org_id NULL = the global Kovio demo set.
+#     Always is_demo so the dashboard badges them; a demo-loaded (multi-item)
+#     session runs blended and never binds a real campaign. Migration 010.
+# =====================================================================
+class DemoCreative(Base):
+    __tablename__ = "demo_creatives"
+    __table_args__ = (
+        CheckConstraint(
+            "media_type IN ('image', 'video')",
+            name="demo_creatives_media_type_check",
+        ),
+        Index("ix_demo_creatives_org", "org_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    media_url: Mapped[str] = mapped_column(Text, nullable=False)
+    media_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    default_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("8"), default=8
+    )
+    is_demo: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("TRUE"), default=True
+    )
     created_at: Mapped[datetime] = _created_at()

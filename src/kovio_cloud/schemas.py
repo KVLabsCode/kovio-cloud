@@ -221,6 +221,10 @@ class SessionRobotsResponse(BaseModel):
 class SessionStartIn(BaseModel):
     robot_id: uuid.UUID
     display_id: uuid.UUID | None = None
+    # V2 (migration 010): the campaign the operator asserts is on screen.
+    # Only accepted for a single-creative display; a looping display's session
+    # is blended and must not bind a campaign.
+    campaign_id: uuid.UUID | None = None
 
 
 class SessionStopIn(BaseModel):
@@ -234,6 +238,8 @@ class SessionOut(BaseModel):
     fleet_id: uuid.UUID
     org_id: uuid.UUID
     display_id: uuid.UUID | None
+    campaign_id: uuid.UUID | None = None
+    is_blended: bool = False
     status: str
     started_at: datetime
     ended_at: datetime | None
@@ -246,6 +252,169 @@ class SessionCurrentOut(BaseModel):
     session_id: uuid.UUID | None = None
     started_at: datetime | None = None
     frame_interval_seconds: int = 5
+    # Dedup window the robot's tracker should honour (bound campaign's
+    # encounter_cap_seconds, else the 300s default).
+    encounter_cap_seconds: int | None = None
+
+
+# --- V2 audience moments (migration 010) -----------------------------------
+class MomentIn(BaseModel):
+    """One on-device audience moment. Extra keys are ignored so newer robots
+    can ship richer payloads without breaking older servers."""
+
+    moment_id: uuid.UUID
+    kind: str
+    track_id: int
+    t: float
+    closest_m: float | None = None
+    min_m: float | None = None
+    dwell_s: float | None = None
+    duration_s: float | None = None
+    tier: str | None = None
+    camera_confirmed: bool | None = None
+    lidar_confirmed: bool | None = None
+    first_seen: float | None = None
+
+    model_config = {"extra": "ignore"}
+
+
+class SensorHealthIn(BaseModel):
+    lidar_ok: bool = False
+    lidar_hz: float = 0.0
+    depth_ok: bool = False
+    tracks: int = 0
+
+    model_config = {"extra": "ignore"}
+
+
+class MomentsIn(BaseModel):
+    moments: list[MomentIn] = []
+    sensor: SensorHealthIn | None = None
+
+
+class MomentsAck(BaseModel):
+    accepted: int
+    duplicates: int
+
+
+class SensorHealthOut(BaseModel):
+    lidar_ok: bool
+    lidar_hz: float
+    depth_ok: bool
+    age_seconds: float | None = None
+
+
+class SessionMetricsOut(BaseModel):
+    """Live tiles for the session panel — unique-track counts over
+    audience_samples for the session window, plus sensor health so a dead
+    sensor shows DEGRADED instead of a silent zero."""
+
+    session_id: uuid.UUID
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    is_blended: bool
+    campaign_id: uuid.UUID | None
+    reach_unique: int
+    passersby_gross: int
+    dwell_paused_plus: int
+    dwell_engaged_plus: int
+    dwell_deep: int
+    close_approaches: int
+    sensor: SensorHealthOut | None
+    degraded: bool  # LiDAR not delivering -> reach/dwell can't be trusted
+
+
+class SessionCampaignOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    advertiser: str
+    status: str
+    enabled: bool
+
+    model_config = {"from_attributes": True}
+
+
+# --- Demo creative library + playlist editing (migration 010) ----------------
+class DemoCreativeOut(BaseModel):
+    id: uuid.UUID
+    org_id: uuid.UUID | None
+    label: str
+    media_url: str
+    media_type: str
+    default_seconds: int
+    is_demo: bool
+
+    model_config = {"from_attributes": True}
+
+
+class DisplayItemOut(BaseModel):
+    id: uuid.UUID
+    media_url: str
+    media_type: str
+    duration_seconds: int | None
+    position: int
+
+    model_config = {"from_attributes": True}
+
+
+class DisplayItemsOut(BaseModel):
+    display_id: uuid.UUID
+    name: str
+    default_image_seconds: int
+    items: list[DisplayItemOut]
+
+
+class DisplayItemCreateIn(BaseModel):
+    media_url: str
+    media_type: str  # 'image' | 'video'
+    duration_seconds: int | None = None
+
+
+class DisplayItemPatchIn(BaseModel):
+    duration_seconds: int | None = None
+
+
+class DisplayItemsReorderIn(BaseModel):
+    item_ids: list[uuid.UUID]
+
+
+class LoadPresetIn(BaseModel):
+    creative_ids: list[uuid.UUID]
+
+
+# --- Audience rollups (read-only; settlement untouched) ----------------------
+class AudienceSessionRow(BaseModel):
+    session_id: uuid.UUID
+    started_at: datetime
+    ended_at: datetime | None
+    is_blended: bool
+    campaign_id: uuid.UUID | None
+    display_id: uuid.UUID | None
+    reach_unique: int
+    passersby_gross: int
+    dwell_engaged_plus: int
+    dwell_deep: int
+    close_approaches: int
+
+
+class AudienceRollupOut(BaseModel):
+    """Aggregate over audience_samples for one campaign or one display."""
+
+    scope: str                      # 'campaign' | 'display'
+    scope_id: uuid.UUID
+    label: str
+    blended: bool                   # display rollups: blended across creatives
+    creative_count: int | None = None
+    from_ts: datetime | None
+    to_ts: datetime | None
+    reach_unique: int
+    passersby_gross: int
+    dwell_paused_plus: int
+    dwell_engaged_plus: int
+    dwell_deep: int
+    close_approaches: int
+    sessions: list[AudienceSessionRow]
 
 
 class SessionSummaryOut(BaseModel):
