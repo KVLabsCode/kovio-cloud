@@ -48,6 +48,8 @@ from ..schemas import (
     SessionOut,
     SessionRobotOut,
     SessionRobotsResponse,
+    SessionSpeakIn,
+    SessionSpeakOut,
     SessionStartIn,
     SessionStopIn,
     SessionSummaryOut,
@@ -68,6 +70,15 @@ _FRAMES: dict[uuid.UUID, tuple[bytes, datetime]] = {}
 # Latest sensor-health snapshot per robot UUID -> (dict, received_at). Same
 # in-RAM posture as _FRAMES: live-panel plumbing, never persisted.
 _SENSORS: dict[uuid.UUID, tuple[dict, datetime]] = {}
+
+# Pending dashboard TTS per robot UUID -> (text, nonce, volume, queued_at).
+# Same in-RAM posture as _FRAMES/_SENSORS: a single latest utterance per robot,
+# surfaced on the robot's /current poll, dropped on stop/restart. The robot
+# de-dupes on the nonce, and we only surface utterances younger than
+# _SPEECH_TTL_S so a stale command can't replay after the robot reconnects.
+_PENDING_SPEECH: dict[uuid.UUID, tuple[str, str, int | None, datetime]] = {}
+
+_SPEECH_TTL_SECONDS = 30
 
 _MAX_FRAME_BYTES = 2_000_000  # hotspot-friendly cap; ~640x480 JPEGs are ~50KB
 
@@ -307,6 +318,7 @@ async def stop_session(
         await session.flush()
     _FRAMES.pop(row.robot_id, None)
     _SENSORS.pop(row.robot_id, None)
+    _PENDING_SPEECH.pop(row.robot_id, None)
     log.info("session_stopped", session_id=str(row.id))
     return SessionOut.model_validate(row)
 
@@ -345,12 +357,67 @@ async def current_session(
                 )
             )
         ).scalar_one_or_none() or cap
+    speak_text = speak_nonce = None
+    speak_volume = None
+    pending = _PENDING_SPEECH.get(robot.id)
+    if pending is not None:
+        text, nonce, volume, queued_at = pending
+        age = (datetime.now(timezone.utc) - queued_at).total_seconds()
+        if age <= _SPEECH_TTL_SECONDS:
+            speak_text, speak_nonce, speak_volume = text, nonce, volume
+        else:
+            # Expired before the robot picked it up (offline/restart): drop it
+            # so it can never replay on reconnect.
+            _PENDING_SPEECH.pop(robot.id, None)
+
     return SessionCurrentOut(
         active=True,
         session_id=row.id,
         started_at=row.started_at,
         encounter_cap_seconds=cap,
+        speak_text=speak_text,
+        speak_nonce=speak_nonce,
+        speak_volume=speak_volume,
     )
+
+
+# --- POST /speak — admin queues TTS for a robot's open session -------------------
+@router.post("/speak", response_model=SessionSpeakOut)
+async def speak(
+    body: SessionSpeakIn,
+    ctx: AuthContext = Depends(require_sdk_auth),
+    session: AsyncSession = Depends(get_session),
+) -> SessionSpeakOut:
+    """Queue a line of text for the robot to speak. Requires an open session
+    (the robot only polls /current — hence only receives speech — while live),
+    which also scopes the feature to "we're live showing campaigns". The text
+    is held in process RAM (latest wins per robot) and handed to the robot on
+    its next /current poll; ~5s worst-case latency. Same ``sdk`` fleet-key auth
+    the admin panel already uses for start/stop."""
+
+    fleet_id = _require_fleet(ctx)
+    robot = await _fleet_robot(session, fleet_id, body.robot_id)
+    open_session = await _open_session_for_robot(session, robot.id)
+    if open_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No open session for this robot — start one before speaking.",
+        )
+
+    nonce = uuid.uuid4().hex
+    _PENDING_SPEECH[robot.id] = (
+        body.text,
+        nonce,
+        body.volume,
+        datetime.now(timezone.utc),
+    )
+    log.info(
+        "session_speak_queued",
+        session_id=str(open_session.id),
+        robot=robot.external_id,
+        chars=len(body.text),
+    )
+    return SessionSpeakOut(ok=True, nonce=nonce)
 
 
 # --- POST /frame — robot uploads the latest JPEG ---------------------------------

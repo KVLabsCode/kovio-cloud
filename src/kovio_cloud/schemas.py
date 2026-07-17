@@ -255,6 +255,23 @@ class SessionCurrentOut(BaseModel):
     # Dedup window the robot's tracker should honour (bound campaign's
     # encounter_cap_seconds, else the 300s default).
     encounter_cap_seconds: int | None = None
+    # Dashboard-driven TTS: a pending utterance for this robot, if any. The
+    # robot speaks it once and de-dupes on speak_nonce across the recurring
+    # poll. All three are null when nothing is queued.
+    speak_text: str | None = None
+    speak_nonce: str | None = None
+    speak_volume: int | None = None
+
+
+class SessionSpeakIn(BaseModel):
+    robot_id: uuid.UUID
+    text: str = Field(min_length=1, max_length=500)
+    volume: int | None = Field(default=None, ge=0, le=100)
+
+
+class SessionSpeakOut(BaseModel):
+    ok: bool
+    nonce: str
 
 
 # --- V2 audience moments (migration 010) -----------------------------------
