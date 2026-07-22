@@ -261,6 +261,14 @@ class SessionCurrentOut(BaseModel):
     speak_text: str | None = None
     speak_nonce: str | None = None
     speak_volume: int | None = None
+    # Greeting-on-Go: when set, the robot fetches this (fleet-key auth) and plays
+    # the returned WAV out its Bluetooth speaker instead of onboard TTS. Shares
+    # speak_nonce for de-dup, and takes precedence over speak_text when present.
+    speak_audio_url: str | None = None
+    # Push-to-talk: when set, the dashboard has opened a listening window. The
+    # robot captures mic audio once per new listen_nonce, transcribes locally,
+    # and POSTs the text to /utterance. Null when no window is open.
+    listen_nonce: str | None = None
 
 
 class SessionSpeakIn(BaseModel):
@@ -272,6 +280,25 @@ class SessionSpeakIn(BaseModel):
 class SessionSpeakOut(BaseModel):
     ok: bool
     nonce: str
+
+
+# --- Push-to-talk conversation ---------------------------------------------
+class SessionListenIn(BaseModel):
+    robot_id: uuid.UUID
+
+
+class SessionListenOut(BaseModel):
+    ok: bool
+    nonce: str
+
+
+class SessionUtteranceIn(BaseModel):
+    """The robot's locally-transcribed speech for a listening window. ``nonce``
+    is the listen_nonce it acted on (for logging/correlation)."""
+
+    text: str = Field(min_length=1, max_length=1000)
+    nonce: str | None = None
+    volume: int | None = Field(default=None, ge=0, le=100)
 
 
 # --- V2 audience moments (migration 010) -----------------------------------

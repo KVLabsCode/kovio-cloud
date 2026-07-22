@@ -18,13 +18,25 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import AuthContext, require_sdk_auth
+from ..config import get_settings
+from ..conversation import reply_wav
 from ..db import get_logger, get_session
+from ..greeting import build_context, render_greeting_wav
 from ..models import (
     AudienceSample,
     Campaign,
@@ -44,6 +56,8 @@ from ..schemas import (
     SensorHealthOut,
     SessionCampaignOut,
     SessionCurrentOut,
+    SessionListenIn,
+    SessionListenOut,
     SessionMetricsOut,
     SessionOut,
     SessionRobotOut,
@@ -53,6 +67,7 @@ from ..schemas import (
     SessionStartIn,
     SessionStopIn,
     SessionSummaryOut,
+    SessionUtteranceIn,
 )
 
 router = APIRouter(prefix="/session/v1", tags=["sessions"])
@@ -79,6 +94,30 @@ _SENSORS: dict[uuid.UUID, tuple[dict, datetime]] = {}
 _PENDING_SPEECH: dict[uuid.UUID, tuple[str, str, int | None, datetime]] = {}
 
 _SPEECH_TTL_SECONDS = 30
+
+# Pending greeting audio per robot UUID -> (wav_bytes, nonce, text, queued_at).
+# Rendered off-request when a session starts (OpenRouter -> ElevenLabs), held in
+# process RAM exactly like _FRAMES/_PENDING_SPEECH, fetched once by the robot's
+# /current poll and played out its Bluetooth speaker, dropped on stop/restart.
+# TTL is generous because rendering takes a second or two before the robot's
+# next poll can pick it up; it still can't replay after a reconnect gap.
+_PENDING_AUDIO: dict[uuid.UUID, tuple[bytes, str, str, datetime]] = {}
+
+_AUDIO_TTL_SECONDS = 90
+
+# Push-to-talk: an open listening window per robot UUID -> (nonce, opened_at).
+# Set when the dashboard presses "Listen", surfaced on /current, consumed once
+# by the robot (it de-dupes on the nonce). Short TTL so a missed press can't
+# make the robot listen minutes later.
+_PENDING_LISTEN: dict[uuid.UUID, tuple[str, datetime]] = {}
+
+_LISTEN_TTL_SECONDS = 20
+
+# Per-session conversation history: session UUID -> [{role, content}, ...].
+# Process-RAM only, like every other bit of session live-state; dropped on stop.
+_CONVO: dict[uuid.UUID, list[dict]] = {}
+
+_CONVO_MAX_MESSAGES = 24  # hard cap so a marathon chat can't grow unbounded
 
 _MAX_FRAME_BYTES = 2_000_000  # hotspot-friendly cap; ~640x480 JPEGs are ~50KB
 
@@ -116,6 +155,24 @@ async def _fleet_robot(
     if robot is None:
         raise HTTPException(status_code=404, detail="Robot not found in this key's fleet.")
     return robot
+
+
+def _render_greeting_bg(robot_id: uuid.UUID, ctx: dict) -> None:
+    """Background task: render the greeting (OpenRouter -> ElevenLabs) and stash
+    the WAV for the robot's next /current poll. Runs in FastAPI's threadpool
+    (``render_greeting_wav`` is sync ``requests``); total — never raises."""
+    settings = get_settings()
+    result = render_greeting_wav(ctx, settings)
+    if result is None:
+        return
+    text, wav = result
+    _PENDING_AUDIO[robot_id] = (
+        wav,
+        uuid.uuid4().hex,
+        text,
+        datetime.now(timezone.utc),
+    )
+    log.info("greeting_queued", robot=str(robot_id), wav_bytes=len(wav))
 
 
 async def _open_session_for_robot(
@@ -164,6 +221,7 @@ async def list_robots(
 @router.post("/start", response_model=SessionOut)
 async def start_session(
     body: SessionStartIn,
+    background_tasks: BackgroundTasks,
     ctx: AuthContext = Depends(require_sdk_auth),
     session: AsyncSession = Depends(get_session),
 ) -> SessionOut:
@@ -283,6 +341,24 @@ async def start_session(
         campaign_id=str(campaign.id) if campaign is not None else None,
         is_blended=is_blended,
     )
+
+    # Greeting-on-Go: render a fresh spoken welcome off-request so /start stays
+    # snappy. The WAV lands in _PENDING_AUDIO within a second or two and the
+    # robot picks it up on its next 5s poll. Feature-flagged; any failure inside
+    # the task is swallowed (session start must never depend on it).
+    if get_settings().greeting_on_start:
+        _PENDING_AUDIO.pop(robot.id, None)  # clear any stale greeting first
+        background_tasks.add_task(
+            _render_greeting_bg,
+            robot.id,
+            build_context(
+                campaign_name=campaign.name if campaign is not None else None,
+                advertiser=campaign.advertiser if campaign is not None else None,
+                category=campaign.category if campaign is not None else None,
+                is_blended=is_blended,
+            ),
+        )
+
     return SessionOut.model_validate(row)
 
 
@@ -319,6 +395,9 @@ async def stop_session(
     _FRAMES.pop(row.robot_id, None)
     _SENSORS.pop(row.robot_id, None)
     _PENDING_SPEECH.pop(row.robot_id, None)
+    _PENDING_AUDIO.pop(row.robot_id, None)
+    _PENDING_LISTEN.pop(row.robot_id, None)
+    _CONVO.pop(row.id, None)
     log.info("session_stopped", session_id=str(row.id))
     return SessionOut.model_validate(row)
 
@@ -357,18 +436,45 @@ async def current_session(
                 )
             )
         ).scalar_one_or_none() or cap
-    speak_text = speak_nonce = None
+    speak_text = speak_nonce = speak_audio_url = None
     speak_volume = None
-    pending = _PENDING_SPEECH.get(robot.id)
-    if pending is not None:
-        text, nonce, volume, queued_at = pending
-        age = (datetime.now(timezone.utc) - queued_at).total_seconds()
-        if age <= _SPEECH_TTL_SECONDS:
-            speak_text, speak_nonce, speak_volume = text, nonce, volume
+
+    # Greeting audio (rendered voice) takes precedence over dashboard text TTS:
+    # when a greeting is pending we hand the robot a URL to fetch+play the WAV
+    # out its Bluetooth speaker instead of the onboard robotic TTS.
+    audio = _PENDING_AUDIO.get(robot.id)
+    if audio is not None:
+        _wav, a_nonce, _text, a_queued = audio
+        if (datetime.now(timezone.utc) - a_queued).total_seconds() <= _AUDIO_TTL_SECONDS:
+            speak_nonce = a_nonce
+            speak_audio_url = (
+                f"/session/v1/speak-audio?robot_id={robot.external_id}"
+                f"&nonce={a_nonce}"
+            )
         else:
-            # Expired before the robot picked it up (offline/restart): drop it
-            # so it can never replay on reconnect.
-            _PENDING_SPEECH.pop(robot.id, None)
+            _PENDING_AUDIO.pop(robot.id, None)
+
+    if speak_audio_url is None:
+        pending = _PENDING_SPEECH.get(robot.id)
+        if pending is not None:
+            text, nonce, volume, queued_at = pending
+            age = (datetime.now(timezone.utc) - queued_at).total_seconds()
+            if age <= _SPEECH_TTL_SECONDS:
+                speak_text, speak_nonce, speak_volume = text, nonce, volume
+            else:
+                # Expired before the robot picked it up (offline/restart): drop
+                # it so it can never replay on reconnect.
+                _PENDING_SPEECH.pop(robot.id, None)
+
+    # Push-to-talk: surface an open listening window if one is pending & fresh.
+    listen_nonce = None
+    listen = _PENDING_LISTEN.get(robot.id)
+    if listen is not None:
+        l_nonce, opened_at = listen
+        if (datetime.now(timezone.utc) - opened_at).total_seconds() <= _LISTEN_TTL_SECONDS:
+            listen_nonce = l_nonce
+        else:
+            _PENDING_LISTEN.pop(robot.id, None)
 
     return SessionCurrentOut(
         active=True,
@@ -378,6 +484,133 @@ async def current_session(
         speak_text=speak_text,
         speak_nonce=speak_nonce,
         speak_volume=speak_volume,
+        speak_audio_url=speak_audio_url,
+        listen_nonce=listen_nonce,
+    )
+
+
+# --- POST /listen — dashboard opens a push-to-talk window ------------------------
+@router.post("/listen", response_model=SessionListenOut)
+async def listen(
+    body: SessionListenIn,
+    ctx: AuthContext = Depends(require_sdk_auth),
+    session: AsyncSession = Depends(get_session),
+) -> SessionListenOut:
+    """Open a listening window: the robot will capture mic audio once, transcribe
+    it locally, and POST the text to /utterance. Requires an open session (same
+    gate as /speak). Latest-wins per robot, short TTL — same in-RAM posture as
+    the speak queue."""
+
+    fleet_id = _require_fleet(ctx)
+    robot = await _fleet_robot(session, fleet_id, body.robot_id)
+    open_session = await _open_session_for_robot(session, robot.id)
+    if open_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No open session for this robot — start one before listening.",
+        )
+    nonce = uuid.uuid4().hex
+    _PENDING_LISTEN[robot.id] = (nonce, datetime.now(timezone.utc))
+    log.info("session_listen_opened", session_id=str(open_session.id), robot=robot.external_id)
+    return SessionListenOut(ok=True, nonce=nonce)
+
+
+# --- POST /utterance — robot uploads recognized speech, gets a spoken reply -----
+@router.post("/utterance")
+async def utterance(
+    body: SessionUtteranceIn,
+    robot_id: str,
+    ctx: AuthContext = Depends(require_sdk_auth),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """The robot's locally-transcribed speech. We append it to the session's
+    conversation, ask the LLM for a reply, render it with ElevenLabs, and return
+    the reply WAV directly (audio/wav) so the robot can play it immediately —
+    no extra poll round-trip. The reply text rides in the ``X-Reply-Text``
+    header. Requires an open session; 409 tells the robot to stop."""
+
+    fleet_id = _require_fleet(ctx)
+    robot = (
+        await session.execute(
+            select(Robot).where(
+                Robot.fleet_id == fleet_id, Robot.external_id == robot_id
+            )
+        )
+    ).scalar_one_or_none()
+    if robot is None:
+        raise HTTPException(status_code=404, detail="Unknown robot.")
+    open_session = await _open_session_for_robot(session, robot.id)
+    if open_session is None:
+        raise HTTPException(status_code=409, detail="No open session for this robot.")
+
+    # The window is single-shot: consume it so a retry/re-poll can't re-listen.
+    _PENDING_LISTEN.pop(robot.id, None)
+
+    history = _CONVO.setdefault(open_session.id, [])
+    history.append({"role": "user", "content": body.text})
+    log.info(
+        "session_utterance",
+        session_id=str(open_session.id),
+        robot=robot.external_id,
+        chars=len(body.text),
+    )
+
+    settings = get_settings()
+    result = await run_in_threadpool(reply_wav, list(history), settings)
+    if result is None:
+        # No reply (LLM/TTS off or errored): keep the user turn but don't leave a
+        # dangling assistant turn; tell the robot there's nothing to play.
+        raise HTTPException(status_code=503, detail="Reply generation unavailable.")
+
+    reply_text, wav = result
+    history.append({"role": "assistant", "content": reply_text})
+    # Trim to the cap (keep the most recent turns).
+    if len(history) > _CONVO_MAX_MESSAGES:
+        del history[: len(history) - _CONVO_MAX_MESSAGES]
+
+    return Response(
+        content=wav,
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Reply-Text": reply_text.encode("ascii", "replace").decode("ascii"),
+        },
+    )
+
+
+# --- GET /speak-audio — the robot fetches its pending greeting WAV ---------------
+@router.get("/speak-audio")
+async def get_speak_audio(
+    robot_id: str,
+    nonce: str,
+    ctx: AuthContext = Depends(require_sdk_auth),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Serve the pending greeting WAV for a robot (by external_id + nonce).
+
+    Same fleet-key auth and in-RAM posture as /frame: the bytes live only in
+    ``_PENDING_AUDIO`` and are fetched once by the robot on the poll that saw
+    ``speak_audio_url``. The nonce must match so a stale URL can't pull a newer
+    greeting."""
+
+    fleet_id = _require_fleet(ctx)
+    robot = (
+        await session.execute(
+            select(Robot).where(
+                Robot.fleet_id == fleet_id, Robot.external_id == robot_id
+            )
+        )
+    ).scalar_one_or_none()
+    if robot is None:
+        raise HTTPException(status_code=404, detail="Unknown robot.")
+    entry = _PENDING_AUDIO.get(robot.id)
+    if entry is None or entry[1] != nonce:
+        raise HTTPException(status_code=404, detail="No pending greeting for this nonce.")
+    wav, _nonce, _text, _queued = entry
+    return Response(
+        content=wav,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
     )
 
 

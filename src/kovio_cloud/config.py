@@ -54,6 +54,24 @@ class Settings(BaseSettings):
     spend_processor_enabled: bool = True
     spend_processor_interval_seconds: int = 60
 
+    # --- Greeting-on-Go (natural LLM voice out the robot's JBL) -----------------
+    # When a session starts we (optionally) generate a fresh spoken greeting:
+    # OpenRouter writes the line, ElevenLabs renders the voice, and the WAV is
+    # stashed in RAM for the robot's /current poll to fetch and play to its
+    # Bluetooth speaker. Every field empty/false => feature disabled, and
+    # /start behaves exactly as before (no greeting, no added latency path).
+    greeting_on_start: bool = False
+    # OpenRouter (same gateway the web app's enrich route uses).
+    openrouter_api_key: str = ""
+    greeting_model: str = "anthropic/claude-haiku-4.5"
+    # ElevenLabs TTS.
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = ""
+    # PCM sample rate ElevenLabs renders at; wrapped into a WAV container so the
+    # robot can play it with paplay without an mp3 decoder. 22050 is available on
+    # every ElevenLabs tier; the robot's sink resamples as needed.
+    elevenlabs_sample_rate: int = 22050
+
     # --- HTTP server (used by `kovio-cloud serve`) -----------------------------
     host: str = "0.0.0.0"
     port: int = 8080
