@@ -36,7 +36,7 @@ from ..auth import AuthContext, require_sdk_auth
 from ..config import get_settings
 from ..conversation import reply_wav
 from ..db import get_logger, get_session
-from ..greeting import build_context, render_greeting_wav
+from ..greeting import build_context, render_greeting_wav, synthesize_wav
 from ..models import (
     AudienceSample,
     Campaign,
@@ -641,12 +641,13 @@ async def speak(
     ctx: AuthContext = Depends(require_sdk_auth),
     session: AsyncSession = Depends(get_session),
 ) -> SessionSpeakOut:
-    """Queue a line of text for the robot to speak. Requires an open session
-    (the robot only polls /current — hence only receives speech — while live),
-    which also scopes the feature to "we're live showing campaigns". The text
-    is held in process RAM (latest wins per robot) and handed to the robot on
-    its next /current poll; ~5s worst-case latency. Same ``sdk`` fleet-key auth
-    the admin panel already uses for start/stop."""
+    """Queue a line of text for the robot to speak. We render it to the same
+    natural ElevenLabs voice as greetings and play it out the robot's Bluetooth
+    speaker (the JBL) — falling back to the robot's onboard TTS only if
+    ElevenLabs isn't configured or fails. Requires an open session (the robot
+    only polls /current — hence only receives speech — while live). Held in
+    process RAM (latest wins per robot), handed over on the next /current poll.
+    Same ``sdk`` fleet-key auth the admin panel already uses for start/stop."""
 
     fleet_id = _require_fleet(ctx)
     robot = await _fleet_robot(session, fleet_id, body.robot_id)
@@ -658,17 +659,27 @@ async def speak(
         )
 
     nonce = uuid.uuid4().hex
-    _PENDING_SPEECH[robot.id] = (
-        body.text,
-        nonce,
-        body.volume,
-        datetime.now(timezone.utc),
-    )
+    now = datetime.now(timezone.utc)
+    # Render to the natural voice and route through the JBL, mirroring greetings.
+    settings = get_settings()
+    wav = None
+    if settings.elevenlabs_api_key and settings.elevenlabs_voice_id:
+        wav = await run_in_threadpool(synthesize_wav, body.text, settings)
+    if wav is not None:
+        # Clear any queued onboard line and hand over the JBL audio instead.
+        _PENDING_SPEECH.pop(robot.id, None)
+        _PENDING_AUDIO[robot.id] = (wav, nonce, body.text, now)
+        via = "jbl"
+    else:
+        # ElevenLabs off/errored: fall back to the robot's onboard TTS.
+        _PENDING_SPEECH[robot.id] = (body.text, nonce, body.volume, now)
+        via = "onboard"
     log.info(
         "session_speak_queued",
         session_id=str(open_session.id),
         robot=robot.external_id,
         chars=len(body.text),
+        via=via,
     )
     return SessionSpeakOut(ok=True, nonce=nonce)
 
