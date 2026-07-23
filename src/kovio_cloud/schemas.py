@@ -265,10 +265,10 @@ class SessionCurrentOut(BaseModel):
     # the returned WAV out its Bluetooth speaker instead of onboard TTS. Shares
     # speak_nonce for de-dup, and takes precedence over speak_text when present.
     speak_audio_url: str | None = None
-    # Push-to-talk: when set, the dashboard has opened a listening window. The
-    # robot captures mic audio once per new listen_nonce, transcribes locally,
-    # and POSTs the text to /utterance. Null when no window is open.
-    listen_nonce: str | None = None
+    # Conversation mode: when true, the robot should be in CONTINUOUS
+    # listen/reply mode (capture -> transcribe -> /utterance -> play -> repeat)
+    # until this flips false. Toggled by /listen and /conversation/stop.
+    conversation_active: bool = False
 
 
 class SessionSpeakIn(BaseModel):

@@ -105,13 +105,13 @@ _PENDING_AUDIO: dict[uuid.UUID, tuple[bytes, str, str, datetime]] = {}
 
 _AUDIO_TTL_SECONDS = 90
 
-# Push-to-talk: an open listening window per robot UUID -> (nonce, opened_at).
-# Set when the dashboard presses "Listen", surfaced on /current, consumed once
-# by the robot (it de-dupes on the nonce). Short TTL so a missed press can't
-# make the robot listen minutes later.
-_PENDING_LISTEN: dict[uuid.UUID, tuple[str, datetime]] = {}
+# Conversation mode: robot UUID -> last-activity time. Presence means the robot
+# should be in CONTINUOUS listen/reply mode — opened by /listen, refreshed on
+# each /utterance. Auto-ends after _CONVO_IDLE_TTL of no turns, on explicit
+# /conversation/stop, or on session stop. Same in-RAM posture as the rest.
+_CONVERSATION: dict[uuid.UUID, datetime] = {}
 
-_LISTEN_TTL_SECONDS = 20
+_CONVO_IDLE_TTL_SECONDS = 180
 
 # Per-session conversation history: session UUID -> [{role, content}, ...].
 # Process-RAM only, like every other bit of session live-state; dropped on stop.
@@ -396,7 +396,7 @@ async def stop_session(
     _SENSORS.pop(row.robot_id, None)
     _PENDING_SPEECH.pop(row.robot_id, None)
     _PENDING_AUDIO.pop(row.robot_id, None)
-    _PENDING_LISTEN.pop(row.robot_id, None)
+    _CONVERSATION.pop(row.robot_id, None)
     _CONVO.pop(row.id, None)
     log.info("session_stopped", session_id=str(row.id))
     return SessionOut.model_validate(row)
@@ -466,15 +466,16 @@ async def current_session(
                 # it so it can never replay on reconnect.
                 _PENDING_SPEECH.pop(robot.id, None)
 
-    # Push-to-talk: surface an open listening window if one is pending & fresh.
-    listen_nonce = None
-    listen = _PENDING_LISTEN.get(robot.id)
-    if listen is not None:
-        l_nonce, opened_at = listen
-        if (datetime.now(timezone.utc) - opened_at).total_seconds() <= _LISTEN_TTL_SECONDS:
-            listen_nonce = l_nonce
+    # Conversation mode: tell the robot whether to be in continuous listen/reply
+    # mode. Auto-expires after idle TTL so a forgotten session can't listen
+    # forever.
+    conversation_active = False
+    last = _CONVERSATION.get(robot.id)
+    if last is not None:
+        if (datetime.now(timezone.utc) - last).total_seconds() <= _CONVO_IDLE_TTL_SECONDS:
+            conversation_active = True
         else:
-            _PENDING_LISTEN.pop(robot.id, None)
+            _CONVERSATION.pop(robot.id, None)
 
     return SessionCurrentOut(
         active=True,
@@ -485,21 +486,21 @@ async def current_session(
         speak_nonce=speak_nonce,
         speak_volume=speak_volume,
         speak_audio_url=speak_audio_url,
-        listen_nonce=listen_nonce,
+        conversation_active=conversation_active,
     )
 
 
-# --- POST /listen — dashboard opens a push-to-talk window ------------------------
+# --- POST /listen — enter continuous conversation mode --------------------------
 @router.post("/listen", response_model=SessionListenOut)
 async def listen(
     body: SessionListenIn,
     ctx: AuthContext = Depends(require_sdk_auth),
     session: AsyncSession = Depends(get_session),
 ) -> SessionListenOut:
-    """Open a listening window: the robot will capture mic audio once, transcribe
-    it locally, and POST the text to /utterance. Requires an open session (same
-    gate as /speak). Latest-wins per robot, short TTL — same in-RAM posture as
-    the speak queue."""
+    """Enter CONTINUOUS conversation mode: the robot listens, replies, and
+    re-listens automatically — no need to re-press per turn — until
+    /conversation/stop, session stop, or the idle timeout. Requires an open
+    session. Starts a fresh conversation history."""
 
     fleet_id = _require_fleet(ctx)
     robot = await _fleet_robot(session, fleet_id, body.robot_id)
@@ -507,12 +508,30 @@ async def listen(
     if open_session is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="No open session for this robot — start one before listening.",
+            detail="No open session for this robot — start one before talking.",
         )
-    nonce = uuid.uuid4().hex
-    _PENDING_LISTEN[robot.id] = (nonce, datetime.now(timezone.utc))
-    log.info("session_listen_opened", session_id=str(open_session.id), robot=robot.external_id)
-    return SessionListenOut(ok=True, nonce=nonce)
+    _CONVERSATION[robot.id] = datetime.now(timezone.utc)
+    _CONVO.pop(open_session.id, None)  # fresh conversation each time you start
+    log.info("conversation_started", session_id=str(open_session.id), robot=robot.external_id)
+    return SessionListenOut(ok=True, nonce="conversation")
+
+
+# --- POST /conversation/stop — leave conversation mode --------------------------
+@router.post("/conversation/stop", response_model=SessionListenOut)
+async def conversation_stop(
+    body: SessionListenIn,
+    ctx: AuthContext = Depends(require_sdk_auth),
+    session: AsyncSession = Depends(get_session),
+) -> SessionListenOut:
+    """End continuous conversation mode for a robot (the dashboard 'End'
+    button). The robot's next poll sees conversation_active=False and stops
+    after its current turn."""
+
+    fleet_id = _require_fleet(ctx)
+    robot = await _fleet_robot(session, fleet_id, body.robot_id)
+    _CONVERSATION.pop(robot.id, None)
+    log.info("conversation_stopped", robot=robot.external_id)
+    return SessionListenOut(ok=True, nonce="stopped")
 
 
 # --- POST /utterance — robot uploads recognized speech, gets a spoken reply -----
@@ -543,8 +562,9 @@ async def utterance(
     if open_session is None:
         raise HTTPException(status_code=409, detail="No open session for this robot.")
 
-    # The window is single-shot: consume it so a retry/re-poll can't re-listen.
-    _PENDING_LISTEN.pop(robot.id, None)
+    # Conversation continues — refresh the activity clock so mode stays alive.
+    if robot.id in _CONVERSATION:
+        _CONVERSATION[robot.id] = datetime.now(timezone.utc)
 
     history = _CONVO.setdefault(open_session.id, [])
     history.append({"role": "user", "content": body.text})
